@@ -146,6 +146,14 @@ screenshots/
 browser_data/
 cache/
 logs/
+output/
+
+# Generated videos (keep .gitkeep only)
+generated_videos/*
+!generated_videos/.gitkeep
+
+# Amazon Q / IDE config
+.amazonq/
 
 # LangGraph API files
 .langgraph_api/
