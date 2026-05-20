@@ -1,0 +1,17 @@
+# Agent 1 — CLM/SaaS Platform Analyzer Dependencies
+
+# LangGraph orchestration
+langgraph>=0.2.76
+langchain-core>=0.3.0
+
+# Azure OpenAI SDK (replaces langchain-openai)
+openai>=1.35.0
+
+# Data validation
+pydantic>=2.0.0
+
+# Environment management
+python-dotenv>=1.0.0
+
+# Browser automation
+playwright>=1.48.0
