@@ -1,27 +1,29 @@
 # cost_tracker.py — Azure OpenAI Cost Monitoring & Budget Enforcement
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Optional
+
+from .config import COST_LOG_DIR, MAX_TOKENS_PER_REQUEST, MAX_COST_PER_SESSION
 
 logger = logging.getLogger(__name__)
 
-COST_LOG_DIR = Path(os.getenv("COST_LOG_DIR", "logs"))
-COST_LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-# Azure OpenAI pricing (per 1K tokens) — GPT-4o as of 2024
-# Update these if pricing changes
+# Azure OpenAI pricing (per 1K tokens)
 PRICING = {
     "gpt-4o": {"input": 0.005, "output": 0.015},
     "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
 }
 
-# Budget limits from env
-MAX_TOKENS_PER_REQUEST = int(os.getenv("MAX_TOKENS_PER_REQUEST", "8000"))
-MAX_COST_PER_SESSION = float(os.getenv("MAX_COST_PER_SESSION_USD", "1.0"))
+
+@dataclass
+class CallRecord:
+    """Single LLM call record for audit."""
+    timestamp: float
+    model: str
+    prompt_tokens: int
+    completion_tokens: int
+    cost_usd: float
 
 
 @dataclass
@@ -34,6 +36,7 @@ class SessionUsage:
     total_cost_usd: float = 0.0
     call_count: int = 0
     cache_hits: int = 0
+    calls: list[CallRecord] = field(default_factory=list)
 
     def record_call(self, model: str, prompt_tokens: int, completion_tokens: int) -> None:
         """Record a single LLM call's usage."""
@@ -47,21 +50,26 @@ class SessionUsage:
         )
         self.total_cost_usd += cost
 
+        self.calls.append(CallRecord(
+            timestamp=time.time(),
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cost_usd=round(cost, 6),
+        ))
+
         logger.info(
-            f"💰 Call #{self.call_count} cost: ${cost:.4f} | "
+            f"Call #{self.call_count} cost: ${cost:.4f} | "
             f"Session total: ${self.total_cost_usd:.4f}"
         )
 
     def record_cache_hit(self) -> None:
-        """Record a cache hit (saved money)."""
         self.cache_hits += 1
 
     def is_over_budget(self) -> bool:
-        """Check if session has exceeded the cost budget."""
         return self.total_cost_usd >= MAX_COST_PER_SESSION
 
     def get_summary(self) -> dict:
-        """Return session usage summary."""
         return {
             "call_count": self.call_count,
             "cache_hits": self.cache_hits,
@@ -71,6 +79,15 @@ class SessionUsage:
             "total_cost_usd": round(self.total_cost_usd, 4),
             "budget_remaining_usd": round(MAX_COST_PER_SESSION - self.total_cost_usd, 4),
             "duration_seconds": round(time.time() - self.session_start, 1),
+            "calls": [
+                {
+                    "model": c.model,
+                    "prompt_tokens": c.prompt_tokens,
+                    "completion_tokens": c.completion_tokens,
+                    "cost_usd": c.cost_usd,
+                }
+                for c in self.calls
+            ],
         }
 
     def save_log(self) -> None:
@@ -79,7 +96,7 @@ class SessionUsage:
         log_file.write_text(
             json.dumps(self.get_summary(), indent=2), encoding="utf-8"
         )
-        logger.info(f"📄 Cost log saved: {log_file}")
+        logger.info(f"Cost log saved: {log_file}")
 
 
 # Singleton session tracker
@@ -87,7 +104,6 @@ _current_session: Optional[SessionUsage] = None
 
 
 def get_session() -> SessionUsage:
-    """Get or create the current session tracker."""
     global _current_session
     if _current_session is None:
         _current_session = SessionUsage()
@@ -95,7 +111,6 @@ def get_session() -> SessionUsage:
 
 
 def reset_session() -> None:
-    """Reset session tracker (call at start of new agent run)."""
     global _current_session
     if _current_session:
         _current_session.save_log()
@@ -103,5 +118,5 @@ def reset_session() -> None:
 
 
 def estimate_tokens(text: str) -> int:
-    """Rough token estimate: ~4 chars per token for English text."""
+    """Rough token estimate: ~4 chars per token."""
     return len(text) // 4

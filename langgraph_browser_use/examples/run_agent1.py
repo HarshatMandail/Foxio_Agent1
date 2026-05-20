@@ -25,7 +25,7 @@ async def main():
     )
 
     print("\n" + "=" * 60)
-    print("✅ Agent 1 Execution Completed!")
+    print("[OK] Agent 1 Execution Completed!")
     print("=" * 60)
 
     print(f"\nPlatform Name     : {result.platform_name}")
@@ -33,22 +33,22 @@ async def main():
     print(f"Page Title        : {result.current_page.title}")
     print(f"Overall Journey   : {result.overall_user_journey}")
 
-    print("\n📸 Screenshots:")
+    print("\n[Screenshots]")
     for cap in result.pages_captured:
-        print(f"  → {cap.screenshot_path}")
+        print(f"  - {cap.screenshot_path}")
 
-    print("\n📋 Relevant Workflows:")
+    print("\n[Relevant Workflows]")
     for i, step in enumerate(result.relevant_workflows, 1):
         print(f"  {i}. {step}")
 
-    print("\n🎥 Context For Video Generation:")
+    print("\n[Context For Video Generation]")
     ctx = result.context_for_video
     print(ctx[:500] + "..." if len(ctx) > 500 else ctx)
 
     # Print cost summary
     session = get_session()
     summary = session.get_summary()
-    print(f"\n💰 Cost Summary:")
+    print(f"\n[Cost Summary]")
     print(f"  LLM Calls    : {summary['call_count']}")
     print(f"  Cache Hits   : {summary['cache_hits']}")
     print(f"  Total Tokens : {summary['total_tokens']}")
