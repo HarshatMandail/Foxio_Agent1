@@ -3,7 +3,6 @@ import asyncio
 import json
 import logging
 from datetime import datetime
-from pathlib import Path
 
 from playwright.async_api import Page
 
@@ -20,38 +19,96 @@ def _safe_filename(text: str, max_len: int = 40) -> str:
     ).strip("_") or "page"
 
 
-async def dismiss_popups(page: Page) -> None:
-    """Dismiss common popups/modals/walkthroughs."""
+async def _has_active_form_modal(page: Page) -> bool:
+    """Check if there's an active form/record modal open (not a promotional popup)."""
+    return await page.evaluate("""() => {
+        const dialogs = document.querySelectorAll('[role="dialog"], .slds-modal, .uiModal, .forceModalContainer');
+        for (const d of dialogs) {
+            const hasForm = d.querySelector('input, select, textarea, form, records-lwc-record-layout, records-record-layout-event-broker');
+            if (hasForm) return true;
+            const text = (d.textContent || '').toLowerCase();
+            if (text.includes('save') || text.includes('required') || text.includes('field')) return true;
+        }
+        return false;
+    }""")
+
+
+async def dismiss_popups(page: Page, preserve_form_modals: bool = True) -> None:
+    """Dismiss common popups/walkthroughs/promotional dialogs.
+    If preserve_form_modals=True, will NOT dismiss modals that contain form fields.
+    """
+    # If there's an active form modal, don't dismiss anything
+    if preserve_form_modals:
+        try:
+            if await _has_active_form_modal(page):
+                logger.info("Active form modal detected — skipping popup dismissal")
+                return
+        except Exception:
+            pass
+
+    # Phase 1: JS-based dismissal — only target promotional/walkthrough popups
     await page.evaluate("""() => {
+        // Only dismiss popups that are NOT record/form modals
+        const isFormModal = (el) => {
+            return el.querySelector('input, select, textarea, form, records-lwc-record-layout');
+        };
+
+        const dismissTexts = [
+            'skip', 'dismiss', 'got it', 'no thanks',
+            'not now', 'maybe later', 'remind me later',
+        ];
         const allButtons = document.querySelectorAll('button, a[role="button"], [role="button"]');
         allButtons.forEach(btn => {
             const text = (btn.textContent || '').trim().toLowerCase();
-            if (['skip', 'dismiss', 'got it', 'no thanks', 'close', 'not now'].includes(text)) {
-                btn.click();
+            if (dismissTexts.includes(text)) {
+                // Make sure this button is NOT inside a form modal
+                const parentModal = btn.closest('[role="dialog"], .slds-modal, .uiModal');
+                if (!parentModal || !isFormModal(parentModal)) {
+                    btn.click();
+                }
             }
         });
+
         const closeSelectors = [
-            'button[title="Close"]', 'button[title="Skip"]',
-            'button.slds-popover__close', 'button.slds-modal__close',
+            'button.slds-popover__close',
             '.walkthrough-close', '[data-dismiss]',
+            '.slds-notification__close', '.slds-prompt__close',
+            'button.toastClose',
         ];
         closeSelectors.forEach(sel => {
             document.querySelectorAll(sel).forEach(el => el.click());
         });
     }""")
-    await asyncio.sleep(0.5)
-    try:
-        skip_btn = page.locator('button:has-text("Skip")').first
-        if await skip_btn.is_visible(timeout=500):
-            await skip_btn.click()
-    except Exception:
-        pass
-    try:
-        close_btn = page.locator('[class*="popover"] button, [class*="walkthrough"] button').first
-        if await close_btn.is_visible(timeout=500):
-            await close_btn.click()
-    except Exception:
-        pass
+    await asyncio.sleep(1)
+
+    # Phase 2: Targeted Playwright dismissal for promotional popups only
+    dismiss_selectors = [
+        'button:has-text("Dismiss")',
+        'button:has-text("Skip")',
+        'button:has-text("Not Now")',
+        'button:has-text("Got It")',
+        '[class*="popover"] button',
+        '[class*="walkthrough"] button',
+    ]
+    for selector in dismiss_selectors:
+        try:
+            btn = page.locator(selector).first
+            if await btn.is_visible(timeout=500):
+                # Verify it's not inside a form modal
+                is_in_form = await btn.evaluate(
+                    """(el) => {
+                        const modal = el.closest('[role="dialog"], .slds-modal, .uiModal');
+                        if (!modal) return false;
+                        return !!modal.querySelector('input, select, textarea, form');
+                    }"""
+                )
+                if not is_in_form:
+                    await btn.click()
+                    await asyncio.sleep(0.5)
+        except Exception:
+            continue
+
+    await asyncio.sleep(1)
 
 
 async def has_error_page(page: Page) -> bool:
@@ -119,12 +176,27 @@ _DOM_EXTRACTION_SCRIPT = """() => JSON.stringify({
 
 async def capture_page(page: Page, page_index: int) -> PageCapture | None:
     """Capture screenshot + DOM for the current page. Returns None if error page."""
+    # Check if a form modal is open (don't dismiss it!)
+    has_form_modal = False
     try:
-        await dismiss_popups(page)
+        has_form_modal = await _has_active_form_modal(page)
     except Exception:
         pass
 
-    await asyncio.sleep(1)
+    # Only dismiss popups if there's no active form modal
+    if not has_form_modal:
+        try:
+            await dismiss_popups(page)
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+        # Second pass for stubborn popups
+        try:
+            await dismiss_popups(page)
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+
     try:
         if await has_error_page(page):
             logger.warning("Skipping error/no-access page")
@@ -139,8 +211,13 @@ async def capture_page(page: Page, page_index: int) -> PageCapture | None:
     safe_title = _safe_filename(title)
     screenshot_path = str(SCREENSHOTS_DIR / f"{timestamp}_p{page_index}_{safe_title}.png")
 
-    await page.screenshot(path=screenshot_path, full_page=True)
-    logger.info(f"[{page_index}] Screenshot: {screenshot_path}")
+    # Use viewport screenshot when modal is open (full_page captures background)
+    if has_form_modal:
+        await page.screenshot(path=screenshot_path, full_page=False)
+        logger.info(f"[{page_index}] Screenshot (viewport/modal): {screenshot_path}")
+    else:
+        await page.screenshot(path=screenshot_path, full_page=True)
+        logger.info(f"[{page_index}] Screenshot: {screenshot_path}")
 
     dom_summary = await page.evaluate(_DOM_EXTRACTION_SCRIPT)
     dom_data = json.loads(dom_summary) if isinstance(dom_summary, str) else dom_summary

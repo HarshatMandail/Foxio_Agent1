@@ -8,7 +8,6 @@ Pipeline: Agent 1 → Agent 2 unified flow.
 from .agent import run_agent1
 from .agent2 import run_agent2, generate_video_prompts
 from .browser_pool import shutdown_browser_pool
-from .cache import clear_cache
 from .config import validate_config, validate_url
 from .cost_tracker import get_session, reset_session
 from .graph import create_agent1_graph
@@ -19,16 +18,11 @@ from .pipeline import run_full_pipeline
 from .state import AgentState
 
 __all__ = [
-    # Pipeline (unified)
     "run_full_pipeline",
-    # Agent 1
     "run_agent1",
-    # Agent 2
     "run_agent2",
     "generate_video_prompts",
-    # Navigation
     "plan_navigation",
-    # Shared
     "shutdown_browser_pool",
     "Agent1Output",
     "PageContext",
@@ -38,7 +32,6 @@ __all__ = [
     "create_agent1_graph",
     "get_azure_client",
     "analyze_with_llm",
-    "clear_cache",
     "get_session",
     "reset_session",
     "validate_config",

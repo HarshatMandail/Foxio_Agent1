@@ -16,9 +16,10 @@ BROWSER_DATA_DIR = Path(os.getenv("BROWSER_DATA_DIR", "browser_data"))
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "cache"))
 COST_LOG_DIR = Path(os.getenv("COST_LOG_DIR", "logs"))
 AUDIT_LOG_DIR = Path(os.getenv("AUDIT_LOG_DIR", "logs/audit"))
+AGENT_OUTPUT_DIR = Path(os.getenv("AGENT_OUTPUT_DIR", "logs/agent_output"))
 
 # Ensure directories exist
-for d in [SCREENSHOTS_DIR, BROWSER_DATA_DIR, CACHE_DIR, COST_LOG_DIR, AUDIT_LOG_DIR]:
+for d in [SCREENSHOTS_DIR, BROWSER_DATA_DIR, CACHE_DIR, COST_LOG_DIR, AUDIT_LOG_DIR, AGENT_OUTPUT_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 
@@ -44,7 +45,6 @@ CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "21600"))
 
 HEADLESS = os.getenv("BROWSER_USE_HEADLESS", "false").lower() == "true"
 BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "")
-MAX_PAGES_TO_CRAWL = int(os.getenv("MAX_PAGES_TO_CRAWL", "10"))
 NAVIGATION_TIMEOUT_MS = int(os.getenv("NAVIGATION_TIMEOUT_MS", "30000"))
 PAGE_LOAD_TIMEOUT_MS = int(os.getenv("PAGE_LOAD_TIMEOUT_MS", "15000"))
 WAIT_FOR_LOGIN_TIMEOUT = int(os.getenv("WAIT_FOR_LOGIN_TIMEOUT", "300"))
@@ -68,7 +68,6 @@ URL_BLOCKLIST: list[str] = [
     d.strip().lower() for d in _raw_blocklist.split(",") if d.strip()
 ]
 
-SAFE_BROWSING_MODE = os.getenv("SAFE_BROWSING_MODE", "true").lower() == "true"
 
 
 # ─── Retry / Resilience ──────────────────────────────────────────────────────

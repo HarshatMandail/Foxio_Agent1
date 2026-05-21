@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .config import COST_LOG_DIR, MAX_TOKENS_PER_REQUEST, MAX_COST_PER_SESSION
+from .config import COST_LOG_DIR, MAX_COST_PER_SESSION
 
 logger = logging.getLogger(__name__)
 

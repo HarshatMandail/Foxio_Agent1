@@ -2,21 +2,21 @@
 import asyncio
 import json
 import logging
+import os
 import time
 
 from playwright.async_api import Page
 
 from .browser_helpers import capture_page
-from .browser_pool import get_browser_pool, retry_async, shutdown_browser_pool
+from .browser_pool import get_browser_pool, retry_async
 from .config import (
-    MAX_PAGES_TO_CRAWL,
+    AGENT_OUTPUT_DIR,
     NAVIGATION_TIMEOUT_MS,
     PAGE_LOAD_TIMEOUT_MS,
     WAIT_FOR_LOGIN_TIMEOUT,
     LOGIN_CHECK_INTERVAL,
 )
 from .cost_tracker import get_session, reset_session, estimate_tokens
-from .crawl import discover_and_crawl
 from .llm import analyze_with_llm
 from .logger import AuditLogger
 from .models import Agent1Output, PageCapture, PageContext, UIElement
@@ -27,9 +27,7 @@ from .state import AgentState
 
 logger = logging.getLogger(__name__)
 
-# Max pages to capture in hybrid mode (current + workflow steps)
-MAX_WORKFLOW_PAGES = int(__import__("os").getenv("MAX_WORKFLOW_PAGES", "6"))
-FOCUSED_CRAWL_LIMIT = int(__import__("os").getenv("FOCUSED_CRAWL_LIMIT", "3"))
+MAX_WORKFLOW_PAGES = int(os.getenv("MAX_WORKFLOW_PAGES", "6"))
 
 
 # ─── URL Detection Helpers ────────────────────────────────────────────────────
@@ -287,7 +285,13 @@ async def _execute_workflow_navigation(
                 audit.log("workflow_step_skipped", {"step": i+1, "reason": "element_not_found"})
                 continue
 
-            await asyncio.sleep(wait_after)
+            # Wait for content to render (modals need extra time)
+            base_wait = max(wait_after, 3)
+            await asyncio.sleep(base_wait)
+
+            # For button clicks (likely opening modals), verify content changed
+            if action == "click_button":
+                await _wait_for_new_content(page)
 
             cap = await capture_page(page, len(extra_captures) + 2)
             if cap:
@@ -324,6 +328,41 @@ async def _execute_single_step(page: Page, action: str, target: str) -> bool:
 
     logger.warning(f"Unknown action type: {action}")
     return False
+
+
+async def _wait_for_new_content(page: Page) -> None:
+    """Wait until a modal/form/new content is visible after a button click."""
+    content_selectors = [
+        '[role="dialog"]',
+        '.slds-modal__content',
+        '.slds-modal',
+        'section[role="dialog"]',
+        '.forceModalContainer',
+        '.uiModal',
+        'records-lwc-record-layout',
+        'records-record-layout-event-broker',
+        '.forceDetailPanel',
+    ]
+
+    for attempt in range(20):  # Up to 10 seconds
+        for selector in content_selectors:
+            try:
+                locator = page.locator(selector).first
+                if await locator.is_visible(timeout=200):
+                    # Modal found — now wait for form inputs to render inside
+                    await asyncio.sleep(2)
+                    try:
+                        input_locator = page.locator('[role="dialog"] input, .slds-modal input, .uiModal input').first
+                        await input_locator.wait_for(state="visible", timeout=5000)
+                    except Exception:
+                        await asyncio.sleep(2)
+                    return
+            except Exception:
+                continue
+        await asyncio.sleep(0.5)
+
+    # Fallback wait if nothing detected
+    await asyncio.sleep(3)
 
 
 async def _click_element_by_text(page: Page, text: str, element_type: str = "link") -> bool:
@@ -386,8 +425,8 @@ async def _wait_for_page_change_or_modal(page: Page, url_before: str) -> None:
     """After a click, wait for either a URL change (navigation) or a modal/dialog to appear.
     Salesforce Lightning often opens forms as modals without URL change.
     """
-    # First, give a brief moment for any navigation to start
-    await asyncio.sleep(1)
+    # Give a brief moment for any navigation to start
+    await asyncio.sleep(1.5)
 
     # Check if URL changed (real navigation happened)
     if page.url != url_before:
@@ -395,6 +434,8 @@ async def _wait_for_page_change_or_modal(page: Page, url_before: str) -> None:
             await page.wait_for_load_state("domcontentloaded", timeout=PAGE_LOAD_TIMEOUT_MS)
         except Exception:
             await asyncio.sleep(2)
+        # Extra wait for Salesforce Lightning to finish rendering
+        await asyncio.sleep(2)
         return
 
     # URL didn't change — likely a modal/dialog opened. Wait for it to render.
@@ -408,23 +449,26 @@ async def _wait_for_page_change_or_modal(page: Page, url_before: str) -> None:
         '.uiModal',
         '.panel-content',
         'records-record-layout-event-broker',
+        '.slds-modal__content',
+        'records-lwc-record-layout',
+        '.forceDetailPanel',
     ]
 
-    for attempt in range(10):  # Wait up to 5 seconds (10 * 0.5s)
+    for attempt in range(20):  # Wait up to 10 seconds (20 * 0.5s)
         for selector in modal_selectors:
             try:
                 locator = page.locator(selector).first
                 if await locator.is_visible(timeout=200):
-                    # Modal found — give it extra time to fully render
-                    await asyncio.sleep(1.5)
+                    # Modal found — wait for form fields to render inside it
+                    await asyncio.sleep(3)
                     logger.info(f"  Modal/dialog detected: {selector}")
                     return
             except Exception:
                 continue
         await asyncio.sleep(0.5)
 
-    # Neither navigation nor modal detected — wait a bit and proceed
-    await asyncio.sleep(2)
+    # Neither navigation nor modal detected — wait and proceed
+    await asyncio.sleep(3)
     logger.info("  No navigation or modal detected, proceeding with current state.")
 
 
@@ -541,10 +585,31 @@ async def analyze_and_generate_output(state: AgentState) -> dict:
         f"Calls: {summary['call_count']} | Cache hits: {summary['cache_hits']}"
     )
 
+    # Persist Agent 1 output to disk
+    _save_agent_output(output)
+
     return {"structured_output": output}
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _save_agent_output(output: Agent1Output) -> None:
+    """Persist Agent 1 structured output to disk as JSON."""
+    timestamp = int(time.time())
+    output_file = AGENT_OUTPUT_DIR / f"agent1_output_{timestamp}.json"
+
+    data = output.model_dump()
+    # Remove raw page captures (large/redundant with audit logs)
+    for page in data.get("pages_captured", []):
+        page.pop("dom_summary", None)
+        page.pop("screenshot_path", None)
+
+    output_file.write_text(
+        json.dumps(data, indent=2, default=str),
+        encoding="utf-8",
+    )
+    logger.info(f"Agent 1 output saved: {output_file}")
+
 
 def _fallback_output(captures: list[PageCapture], error_detail: str) -> dict:
     """Generate fallback output when LLM fails."""
@@ -580,5 +645,4 @@ def _normalize_workflows(raw_workflows: list) -> list[str]:
     return workflows
 
 
-# Backward compatibility alias
-navigate_to_url = navigate_and_crawl
+
