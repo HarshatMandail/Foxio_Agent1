@@ -31,7 +31,7 @@ class TutorialStep(BaseModel):
     duration: int = 6
     aspect_ratio: str = "16:9"
     resolution: str = "480p"
-    start_image: str | None = None
+    start_image: str | None = None  # Local screenshot path or URL for image-to-video
 
 
 class PipelineState(TypedDict):

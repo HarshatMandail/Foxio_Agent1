@@ -13,28 +13,27 @@ logger = logging.getLogger(__name__)
 async def run_full_pipeline(
     url: str,
     user_query: str,
-    dry_run: bool = True,
     cleanup_browser: bool = False,
 ) -> dict[str, Any]:
     """
     Execute the complete Foxio pipeline:
-      Agent 1: Navigate platform → capture pages → analyze with LLM → structured output
-      Agent 2: Transform output → generate video prompts → produce tutorial video
+      Agent 1: Navigate platform -> capture pages -> analyze with LLM -> structured output
+      Agent 2: Transform output -> generate video prompts -> produce tutorial video
+
+    DRY_RUN is controlled ONLY via video_pipeline/.env (DRY_RUN=true/false).
 
     Args:
         url: Platform URL to analyze.
         user_query: User's question (e.g., "How do I create a contract?").
-        dry_run: If True, skip actual video API calls (saves credits).
         cleanup_browser: If True, close browser after Agent 1 finishes.
 
     Returns:
         Dict with agent1_output, agent2_output, and overall status.
     """
     logger.info("=" * 60)
-    logger.info("FOXIO PIPELINE — Agent 1 → Agent 2")
+    logger.info("FOXIO PIPELINE -- Agent 1 -> Agent 2")
     logger.info(f"URL: {url}")
     logger.info(f"Query: {user_query}")
-    logger.info(f"Dry Run: {dry_run}")
     logger.info("=" * 60)
 
     # ─── Agent 1: Browser Analysis ────────────────────────────────────────────
@@ -71,7 +70,6 @@ async def run_full_pipeline(
         agent2_output = await run_agent2(
             agent1_output=agent1_dict,
             user_query=user_query,
-            dry_run=dry_run,
         )
     except Exception as e:
         logger.error(f"[Pipeline] Agent 2 failed: {e}")

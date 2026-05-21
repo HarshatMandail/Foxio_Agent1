@@ -8,8 +8,11 @@ Response: response.url, response.duration
 Supports:
   - Text-to-video (prompt only)
   - Image-to-video (prompt + image_url as first frame)
+  - Local screenshot files as start frames (auto-converted to base64 data URI)
 """
 
+import base64
+import mimetypes
 from pathlib import Path
 from typing import Any
 
@@ -25,11 +28,50 @@ SUPPORTED_ASPECT_RATIOS = {"1:1", "16:9", "9:16"}
 SUPPORTED_RESOLUTIONS = {"480p", "720p"}
 
 
+def _local_file_to_data_uri(file_path: str) -> str | None:
+    """Convert a local image file to a base64 data URI for the xAI API."""
+    path = Path(file_path)
+    if not path.exists():
+        logger.warning(f"[GrokAdapter] Screenshot not found: {file_path}")
+        return None
+
+    mime_type = mimetypes.guess_type(str(path))[0] or "image/png"
+    raw_bytes = path.read_bytes()
+    b64 = base64.b64encode(raw_bytes).decode("utf-8")
+
+    logger.info(
+        f"[GrokAdapter] Converted screenshot to data URI | "
+        f"file={path.name} | size={len(raw_bytes)//1024}KB | mime={mime_type}"
+    )
+
+    return f"data:{mime_type};base64,{b64}"
+
+
+def _resolve_image_url(start_image: str | None) -> str | None:
+    """Resolve start_image to a URL the xAI API can consume.
+
+    Handles:
+      - None → None (text-to-video)
+      - HTTP/HTTPS URL → pass through
+      - Local file path → convert to base64 data URI
+    """
+    if not start_image:
+        return None
+
+    # Already a URL
+    if start_image.startswith(("http://", "https://", "data:")):
+        return start_image
+
+    # Local file path — convert to data URI
+    return _local_file_to_data_uri(start_image)
+
+
 class GrokAdapter(VideoGenerationService):
     """
     Official xAI SDK adapter for Grok Imagine Video.
 
     Uses the synchronous Client from xai-sdk package.
+    Supports image-to-video with local screenshots as start frames.
     """
 
     def __init__(self, api_key: str) -> None:
@@ -56,7 +98,7 @@ class GrokAdapter(VideoGenerationService):
             output_path: File path to save the downloaded video.
             aspect_ratio: "16:9", "9:16", or "1:1".
             resolution: "480p" or "720p".
-            start_image: Optional image URL for image-to-video.
+            start_image: Optional image URL or local file path for image-to-video.
             dry_run: If True, log the request without calling the API.
 
         Returns:
@@ -67,9 +109,13 @@ class GrokAdapter(VideoGenerationService):
         validated_resolution = self._validate_resolution(resolution)
         clamped_duration = max(1, min(duration, settings.max_clip_duration))
 
+        # Resolve start_image (local path → data URI, URL → pass through)
+        resolved_image = _resolve_image_url(start_image)
+        mode = "image-to-video" if resolved_image else "text-to-video"
+
         logger.info(
             f"[GrokAdapter] Requesting video | model={model.name} | "
-            f"duration={clamped_duration}s | "
+            f"mode={mode} | duration={clamped_duration}s | "
             f"aspect_ratio={validated_aspect_ratio} | "
             f"resolution={validated_resolution}"
         )
@@ -77,7 +123,7 @@ class GrokAdapter(VideoGenerationService):
         if dry_run or settings.dry_run:
             logger.warning(
                 f"[GrokAdapter] DRY RUN — skipping API call. "
-                f"Prompt: {prompt[:100]}..."
+                f"Mode: {mode} | Prompt: {prompt[:100]}..."
             )
             return {
                 "status": "dry_run",
@@ -85,6 +131,8 @@ class GrokAdapter(VideoGenerationService):
                 "model": model.name,
                 "duration": clamped_duration,
                 "provider": "xai",
+                "mode": mode,
+                "has_start_image": resolved_image is not None,
                 "video_url": None,
                 "cost_usd": 0.0,
             }
@@ -98,8 +146,8 @@ class GrokAdapter(VideoGenerationService):
             "resolution": validated_resolution,
         }
 
-        if start_image:
-            gen_kwargs["image_url"] = start_image
+        if resolved_image:
+            gen_kwargs["image_url"] = resolved_image
 
         # Call the official xAI SDK (synchronous)
         client = Client(api_key=self._api_key)
@@ -115,7 +163,7 @@ class GrokAdapter(VideoGenerationService):
 
         logger.success(
             f"[GrokAdapter] Video saved: {output_path} | "
-            f"duration={response_duration}s"
+            f"mode={mode} | duration={response_duration}s"
         )
 
         return {
@@ -124,6 +172,8 @@ class GrokAdapter(VideoGenerationService):
             "model": model.name,
             "duration": response_duration,
             "provider": "xai",
+            "mode": mode,
+            "has_start_image": resolved_image is not None,
             "video_url": video_url,
             "cost_usd": getattr(response, "cost_usd", None),
         }

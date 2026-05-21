@@ -32,7 +32,6 @@ def _import_video_pipeline():
             f"Ensure video_pipeline/ is in the project root."
         )
 
-    # Temporarily prepend video_pipeline to sys.path for its internal imports
     video_path_str = str(VIDEO_PIPELINE_DIR)
     was_in_path = video_path_str in sys.path
     if not was_in_path:
@@ -50,22 +49,8 @@ def _import_video_pipeline():
             sys.path.remove(video_path_str)
 
 
-def _set_video_dry_run(value: bool) -> None:
-    """Set dry_run on the video pipeline settings."""
-    video_path_str = str(VIDEO_PIPELINE_DIR)
-    was_in_path = video_path_str in sys.path
-    if not was_in_path:
-        sys.path.insert(0, video_path_str)
-    try:
-        import importlib
-        config_mod = importlib.import_module("config.settings")
-        config_mod.settings.dry_run = value
-    finally:
-        if not was_in_path and video_path_str in sys.path:
-            sys.path.remove(video_path_str)
-
-
-AGENT2_SYSTEM_PROMPT = """You are a video prompt engineer for Foxio — an AI that creates beginner-friendly tutorial videos for SaaS platforms.
+AGENT2_SYSTEM_PROMPT = """\
+You are a video prompt engineer for Foxio — an AI that creates beginner-friendly tutorial videos for SaaS platforms.
 
 Your job: Take a platform analysis (pages, workflows, narration script) and convert it into a sequence of video generation prompts optimized for text-to-video AI models (like Grok Imagine Video).
 
@@ -78,6 +63,7 @@ Your job: Take a platform analysis (pages, workflows, narration script) and conv
 6. Include 3-8 steps total (not too few, not too many).
 7. Each prompt should start with "Screen recording showing..." for consistency.
 8. Mention the platform name and page context in each prompt for visual grounding.
+9. IMPORTANT: For each step, include a "screenshot_index" field (0-based) indicating which captured page screenshot should be used as the starting frame for that video clip. If a step doesn't map to any captured page, use the closest relevant one.
 
 ## Output Format (strict JSON):
 {
@@ -90,7 +76,8 @@ Your job: Take a platform analysis (pages, workflows, narration script) and conv
       "duration": 6,
       "aspect_ratio": "16:9",
       "resolution": "480p",
-      "narration_hint": "Brief text overlay or voiceover hint for this clip"
+      "narration_hint": "Brief text overlay or voiceover hint for this clip",
+      "screenshot_index": 0
     }
   ]
 }
@@ -106,8 +93,9 @@ def _build_agent2_input(agent1_output: dict, user_query: str) -> str:
     journey = agent1_output.get("overall_user_journey", "")
 
     pages_summary = []
-    for page in agent1_output.get("pages_captured", []):
+    for i, page in enumerate(agent1_output.get("pages_captured", [])):
         pages_summary.append({
+            "index": i,
             "title": page.get("title", ""),
             "url": page.get("url", ""),
             "screenshot_path": page.get("screenshot_path", ""),
@@ -123,11 +111,16 @@ def _build_agent2_input(agent1_output: dict, user_query: str) -> str:
         f"## User Journey\n{journey}\n\n"
         f"## Workflows\n{json.dumps(workflows, default=str)}\n\n"
         f"## Narration Script (from Agent 1)\n{context_for_video}\n\n"
-        f"## Pages Captured\n{json.dumps(pages_summary, default=str)}\n\n"
+        f"## Pages Captured (with screenshot indices)\n{json.dumps(pages_summary, default=str)}\n\n"
         f"## Instructions\n"
         f"Convert the above into a sequence of video generation prompts.\n"
         f"Each prompt should describe a specific screen recording moment that a "
         f"text-to-video AI can render. Focus on visual clarity and logical flow.\n"
+        f"IMPORTANT: Each step MUST include a 'screenshot_index' field (0-based) "
+        f"mapping to the captured page screenshot that best represents the starting "
+        f"frame for that clip. The screenshot will be used as the first frame of the "
+        f"generated video, so describe the ANIMATION/MOVEMENT that happens AFTER "
+        f"what's shown in the screenshot.\n"
         f"Respond with JSON matching the schema in your system instructions."
     )
 
@@ -170,18 +163,49 @@ async def generate_video_prompts(
     return result
 
 
+def _resolve_screenshot_for_step(
+    step: dict,
+    pages_captured: list[dict],
+) -> str | None:
+    """Resolve the screenshot file path for a given step based on screenshot_index."""
+    screenshot_index = step.get("screenshot_index")
+
+    if screenshot_index is None:
+        return None
+
+    if not isinstance(screenshot_index, int):
+        return None
+
+    if screenshot_index < 0 or screenshot_index >= len(pages_captured):
+        # Clamp to last available screenshot
+        screenshot_index = min(screenshot_index, len(pages_captured) - 1)
+        screenshot_index = max(screenshot_index, 0)
+
+    screenshot_path = pages_captured[screenshot_index].get("screenshot_path", "")
+
+    if not screenshot_path:
+        return None
+
+    # Verify file exists
+    if Path(screenshot_path).exists():
+        return screenshot_path
+
+    return None
+
+
 async def run_agent2(
     agent1_output: dict,
     user_query: str,
-    dry_run: bool = True,
 ) -> dict[str, Any]:
     """
-    Full Agent 2 pipeline: Agent1Output → LLM prompt engineering → Video generation.
+    Full Agent 2 pipeline: Agent1Output -> LLM prompt engineering -> Video generation.
+
+    Screenshots from Agent 1 are wired as start_image for each clip (image-to-video).
+    DRY_RUN is controlled ONLY via video_pipeline/.env (DRY_RUN=true/false).
 
     Args:
         agent1_output: Dict from Agent1Output.model_dump() or equivalent.
         user_query: Original user question.
-        dry_run: If True, skip actual API video generation (saves credits).
 
     Returns:
         Dict with:
@@ -195,17 +219,33 @@ async def run_agent2(
 
     video_title = prompt_result.get("video_title", "Tutorial Video")
     steps = prompt_result.get("steps", [])
+    pages_captured = agent1_output.get("pages_captured", [])
 
-    # Step 2: Format steps for the video pipeline
-    pipeline_steps = [
-        {
+    # Step 2: Format steps for the video pipeline — attach screenshots as start_image
+    pipeline_steps = []
+    for step in steps:
+        screenshot_path = _resolve_screenshot_for_step(step, pages_captured)
+
+        pipeline_step = {
             "prompt": step["prompt"],
             "duration": step.get("duration", 6),
             "aspect_ratio": step.get("aspect_ratio", "16:9"),
             "resolution": step.get("resolution", "480p"),
         }
-        for step in steps
-    ]
+
+        if screenshot_path:
+            pipeline_step["start_image"] = screenshot_path
+            logger.info(
+                f"  Clip {step.get('step_number', '?')}: "
+                f"Using screenshot [{step.get('screenshot_index')}] → {Path(screenshot_path).name}"
+            )
+
+        pipeline_steps.append(pipeline_step)
+
+    screenshots_attached = sum(1 for s in pipeline_steps if s.get("start_image"))
+    logger.info(
+        f"Agent 2: {screenshots_attached}/{len(pipeline_steps)} clips have screenshot start frames"
+    )
 
     # Step 3: Run the video generation pipeline
     try:
@@ -220,20 +260,14 @@ async def run_agent2(
             "error": f"Video pipeline not available: {e}",
         }
 
-    logger.info(
-        f"Agent 2: Running video pipeline | "
-        f"{len(pipeline_steps)} clips | dry_run={dry_run}"
-    )
-
-    # Override dry_run in settings
-    _set_video_dry_run(dry_run)
+    logger.info(f"Agent 2: Running video pipeline | {len(pipeline_steps)} clips")
 
     pipeline_result = await run_pipeline(
         steps=pipeline_steps,
         model_name=None,
     )
 
-    # Step 4: Save metadata for future analysis
+    # Step 4: Save metadata
     job_id = pipeline_result.get("job_id", "unknown")
     _save_run_metadata(
         job_id=job_id,
@@ -241,7 +275,7 @@ async def run_agent2(
         user_query=user_query,
         prompts=steps,
         pipeline_result=pipeline_result,
-        dry_run=dry_run,
+        pages_captured=pages_captured,
     )
 
     final_status = pipeline_result.get("status", "unknown")
@@ -262,7 +296,7 @@ def _save_run_metadata(
     user_query: str,
     prompts: list[dict],
     pipeline_result: dict,
-    dry_run: bool,
+    pages_captured: list[dict] | None = None,
 ) -> None:
     """Save run metadata as JSON for future analysis."""
     GENERATED_VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
@@ -272,9 +306,11 @@ def _save_run_metadata(
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "video_title": video_title,
         "user_query": user_query,
-        "dry_run": dry_run,
         "total_clips": len(prompts),
         "prompts": prompts,
+        "screenshots_used": [
+            p.get("screenshot_path", "") for p in (pages_captured or [])
+        ],
         "pipeline_status": pipeline_result.get("status"),
         "final_video_path": pipeline_result.get("final_video_path"),
         "clip_results": pipeline_result.get("clip_results", []),

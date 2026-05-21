@@ -1,47 +1,22 @@
-# Video Generation Pipeline — xAI Official SDK
+# Video Generation Pipeline (Agent 2) — Foxio
 
-A production-grade video generation pipeline using the **official xAI Python SDK** (`xai-sdk`) with LangGraph orchestration. Generates multi-clip tutorial videos from structured step definitions and concatenates them into a single output using FFmpeg.
+Production-grade tutorial video generation pipeline for **Foxio** — a Chrome extension that helps new users navigate complex CLM (Contract Lifecycle Management) platforms.
 
-## Architecture
+Takes structured output from **Agent 1** (browser analysis) and generates beginner-friendly tutorial videos using **xAI Grok Imagine Video** with LangGraph orchestration.
+
+## How It Works
 
 ```
-main.py → LangGraph StateGraph → [enqueue_clips] → [generate_all_clips] → [concatenate_clips] → [finalize]
-                                       │                     │                      │                  │
-                                  Validate &            xAI SDK              FFmpeg concat         Cleanup
-                                  prepare steps      (concurrent clips)      successful clips      temp files
-                                                           │
-                                                     GrokAdapter
-                                                     (gRPC API)
-                                                           │
-                                                  Download video → Save .mp4
+Agent 1 Output                    Agent 2 (this pipeline)
+─────────────────    ─────────────────────────────────────────────────────────────
+                     ┌─────────────┐    ┌──────────────┐    ┌─────────────┐    ┌──────────┐
+context_for_video ──►│ Step        │───►│ Generate     │───►│ Concatenate │───►│ Finalize │──► tutorial_video.mp4
+platform_name        │ Splitter    │    │ All Clips    │    │ (FFmpeg)    │    │ + Save   │
+pages_captured       │ (4-8 steps) │    │ (xAI SDK)    │    │             │    │ Metadata │
+screenshots          └─────────────┘    └──────────────┘    └─────────────┘    └──────────┘
 ```
 
-## Key Features
-
-- **Official xAI SDK** — gRPC-based client with built-in authentication
-- **LangGraph orchestration** — 4-node stateful DAG workflow (enqueue → generate → concatenate → finalize)
-- **Concurrent clip generation** — all clips generated in parallel via `asyncio.gather`
-- **Exponential backoff retries** — configurable attempts with non-retryable error detection (moderation, invalid_argument, permission_denied)
-- **Dry run mode** — log prompts without making API calls (saves credits during development)
-- **Redis Queue support** — background processing via RQ workers with per-clip fault isolation
-- **FFmpeg concatenation** — clips re-encoded with libx264 and merged into a single final video
-- **Pydantic validation** — type-safe settings and step schema validation
-
-## Supported Generation Modes
-
-| Mode | Input | Description |
-|------|-------|-------------|
-| Text-to-video | `prompt` only | Generate from text description |
-| Image-to-video | `prompt` + `start_image` | Use image URL as first frame |
-
-## SDK Constraints
-
-- **Resolutions**: `480p`, `720p`
-- **Aspect ratios**: `1:1`, `16:9`, `9:16`
-- **Duration**: 1–10 seconds per clip (configurable via `MAX_CLIP_DURATION`)
-- **Model**: `grok-imagine-video`
-
-## Setup
+## Quick Start
 
 ```bash
 # Install dependencies
@@ -49,74 +24,163 @@ pip install -r requirements.txt
 
 # Configure environment
 cp .env.example .env
-# Edit .env and set your XAI_API_KEY
+# Set your XAI_API_KEY in .env
 
-# Run the pipeline
+# Run with sample Agent1Output (dry run by default)
 python main.py
+
+# Run with raw steps (legacy mode)
+python main.py --raw-steps
 ```
+
+## Integration with Agent 1
+
+### From Agent 1 code (recommended):
+
+```python
+from generate_tutorial import generate_tutorial_video
+
+# Agent 1 output (from run_agent1())
+agent1_output = {
+    "platform_name": "Salesforce",
+    "context_for_video": "You are currently on the Contracts page...",
+    "pages_captured": [...],
+    "current_page": {...},
+    "overall_user_journey": "...",
+    "relevant_workflows": [...],
+}
+
+result = await generate_tutorial_video(
+    agent1_output=agent1_output,
+    user_query="How do I create a new contract?",
+    dry_run=False,  # Set False to generate real video
+)
+
+print(result["final_video_path"])  # → generated_videos/tutorial_abc123.mp4
+print(result["metadata_path"])     # → generated_videos/abc123_metadata.json
+```
+
+### From the unified pipeline (langgraph_browser_use):
+
+```python
+from langgraph_browser_agent import run_full_pipeline
+
+result = await run_full_pipeline(
+    url="https://myorg.salesforce.com",
+    user_query="How do I create a new contract?",
+    dry_run=True,
+)
+```
+
+## Step Splitter — The Conversion Layer
+
+The key innovation: Agent 1 produces a single long narration string (`context_for_video`). The **Step Splitter** (`nodes/step_splitter.py`) automatically converts this into 4–8 structured video clips:
+
+1. Splits narration into sentences
+2. Groups related sentences by action boundaries
+3. Generates visual prompts optimized for text-to-video AI
+4. Maps Agent 1 screenshots as `start_image` (image-to-video mode)
+5. Estimates duration per clip based on action complexity
+
+**No LLM call needed** — pure heuristic splitting (fast, free, deterministic).
+
+## Output Structure
+
+```
+langgraph_browser_use/generated_videos/
+├── tutorial_abc123.mp4          # Final concatenated video
+├── abc123_metadata.json         # Full metadata (prompts, costs, timestamps)
+└── clips/                       # Temporary (auto-deleted after concat)
+    ├── clip_000.mp4
+    ├── clip_001.mp4
+    └── ...
+```
+
+### Metadata JSON contains:
+- `job_id`, `timestamp` — tracking
+- `user_query` — what the user asked
+- `video_title` — auto-generated title
+- `steps` — full prompt text for each clip
+- `clip_results` — status, duration, cost per clip
+- `final_video_path` — where the video lives
+
+## Architecture
+
+```
+video_pipeline/
+├── generate_tutorial.py      # ★ Main entry point (Agent1Output → video)
+├── main.py                   # CLI runner (sample data + raw steps mode)
+├── adapters/
+│   ├── base.py               # Abstract VideoGenerationService
+│   └── grok_adapter.py       # xAI SDK implementation (gRPC)
+├── config/
+│   └── settings.py           # Pydantic settings (env-based)
+├── core/
+│   └── registry.py           # Model registry (VideoModel)
+├── graph/
+│   └── workflow.py           # LangGraph StateGraph (4-node DAG)
+├── nodes/
+│   ├── step_splitter.py      # ★ Agent1Output → structured steps converter
+│   ├── video_generator.py    # Clip generation with retry logic
+│   └── utils.py              # FFmpeg concat, directory management
+├── tasks/
+│   └── queue_tasks.py        # Redis Queue background processing
+├── output/                   # Final videos land here
+├── .env                      # Configuration
+└── requirements.txt          # Dependencies
+```
+
+## LangGraph Pipeline Nodes
+
+| Node | Purpose |
+|------|---------|
+| `enqueue_clips` | Validate steps, assign job ID, create directories |
+| `generate_all_clips` | Generate all clips concurrently via asyncio.gather |
+| `concatenate_clips` | Merge clips with FFmpeg (libx264, re-encoded) |
+| `finalize` | Cleanup temp files, return metadata |
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `XAI_API_KEY` | (required) | Your xAI API key from https://console.x.ai |
-| `DEFAULT_MODEL` | `grok-imagine-video` | Model to use |
-| `DEFAULT_RESOLUTION` | `480p` | Default video resolution |
+| `XAI_API_KEY` | (required) | xAI API key from https://console.x.ai |
+| `DEFAULT_MODEL` | `grok-imagine-video` | Video generation model |
+| `DEFAULT_RESOLUTION` | `480p` | Video resolution (`480p` or `720p`) |
 | `MAX_RETRIES` | `3` | Retry attempts per clip |
-| `RETRY_BASE_DELAY` | `2.0` | Base delay (seconds) for exponential backoff |
+| `RETRY_BASE_DELAY` | `2.0` | Exponential backoff base (seconds) |
 | `MAX_CLIP_DURATION` | `10` | Max seconds per clip |
-| `CLIP_OUTPUT_DIR` | `./clips` | Temporary directory for individual clips |
-| `FINAL_OUTPUT_DIR` | `./output` | Directory for final concatenated video |
-| `DRY_RUN` | `false` | Log prompts without API calls |
-| `SDK_GENERATION_TIMEOUT` | `600` | Max wait time for SDK generation (seconds) |
-| `SDK_POLL_INTERVAL` | `1.0` | SDK polling interval (seconds) |
-| `REDIS_URL` | `redis://localhost:6379/0` | Redis connection for RQ |
+| `DRY_RUN` | `true` | Skip API calls (saves credits) |
+| `MIN_TUTORIAL_STEPS` | `4` | Minimum clips per tutorial |
+| `MAX_TUTORIAL_STEPS` | `8` | Maximum clips per tutorial |
+| `DEFAULT_CLIP_DURATION` | `6` | Default clip length (seconds) |
+| `TUTORIAL_ASPECT_RATIO` | `16:9` | Default aspect ratio |
+| `PROMPT_STYLE` | `beginner_friendly` | Prompt generation style |
+| `CLIP_OUTPUT_DIR` | `generated_videos/clips` | Temp clip directory |
+| `FINAL_OUTPUT_DIR` | `generated_videos/` | Final video output |
+| `REDIS_URL` | `redis://localhost:6379/0` | Redis for background queue |
 | `LOG_LEVEL` | `INFO` | Logging level |
 
-## Pipeline Workflow (LangGraph Nodes)
+## Video Generation Modes
 
-1. **enqueue_clips** — Validates steps, assigns job ID, creates output directories
-2. **generate_all_clips** — Generates all clips concurrently with retry logic per clip
-3. **concatenate_clips** — Merges successful clips via FFmpeg concat demuxer (skipped in dry run)
-4. **finalize** — Cleans up temporary clip files, returns final metadata
+| Mode | Input | When Used |
+|------|-------|-----------|
+| Text-to-video | `prompt` only | Default — generates from text description |
+| Image-to-video | `prompt` + `start_image` | When Agent 1 screenshots are available |
 
-## Step Schema
+## Supported Constraints (xAI Grok Imagine)
 
-Each tutorial step accepts:
+- **Resolutions**: `480p`, `720p`
+- **Aspect ratios**: `1:1`, `16:9`, `9:16`
+- **Duration**: 1–10 seconds per clip
+- **Model**: `grok-imagine-video`
 
-```python
-{
-    "prompt": str,           # Required — text description of the video
-    "duration": int,         # Optional — seconds (default: 6, max: 10)
-    "aspect_ratio": str,     # Optional — "16:9", "9:16", "1:1" (default: "16:9")
-    "resolution": str,       # Optional — "480p", "720p" (default: "480p")
-    "start_image": str,      # Optional — image URL for image-to-video mode
-}
-```
+## Redis Queue (Optional)
 
-## Project Structure
+For background processing in production:
 
-```
-video_pipeline/
-├── adapters/
-│   ├── __init__.py          # Adapter factory (get_adapter)
-│   ├── base.py              # Abstract VideoGenerationService interface
-│   └── grok_adapter.py      # xAI SDK implementation (gRPC)
-├── config/
-│   └── settings.py          # Pydantic settings from .env
-├── core/
-│   └── registry.py          # Model registry (VideoModel dataclass)
-├── graph/
-│   └── workflow.py          # LangGraph StateGraph pipeline (4 nodes)
-├── nodes/
-│   ├── video_generator.py   # Clip generation with retry logic
-│   └── utils.py             # FFmpeg concat, directory management, cleanup
-├── tasks/
-│   └── queue_tasks.py       # RQ background task definitions
-├── output/                  # Final concatenated videos
-├── .env.example             # Environment variable template
-├── main.py                  # Entry point with sample tutorial steps
-└── requirements.txt         # Python dependencies
+```bash
+# Start worker
+rq worker video_generation --url redis://localhost:6379/0
 ```
 
 ## Dependencies
@@ -127,24 +191,4 @@ video_pipeline/
 - `httpx` — Async HTTP for video downloads
 - `loguru` — Structured logging
 - `rq` / `redis` — Background job queue
-- `FFmpeg` — System dependency for video concatenation
-
-## Usage with Redis Queue (Optional)
-
-For background processing, start an RQ worker:
-
-```bash
-rq worker video_generation --url redis://localhost:6379/0
-```
-
-Then enqueue clips programmatically:
-
-```python
-from tasks.queue_tasks import enqueue_clip_generation
-
-job = enqueue_clip_generation(
-    step_index=0,
-    prompt="Screen recording of a dashboard...",
-    duration=6,
-)
-```
+- **FFmpeg** — System dependency for video concatenation

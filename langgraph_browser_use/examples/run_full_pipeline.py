@@ -14,7 +14,7 @@ from langgraph_browser_agent import run_full_pipeline, shutdown_browser_pool
 async def main():
     """Run the full Foxio pipeline: Browser Analysis → Video Generation."""
     url = "https://login.salesforce.com"
-    user_query = "How do I create a new contract in Salesforce?"
+    user_query = "How do I create a first contact for growing your sales in Salesforce?"
 
     print("=" * 60)
     print("FOXIO — Full Pipeline (Agent 1 → Agent 2)")
@@ -25,7 +25,6 @@ async def main():
     result = await run_full_pipeline(
         url=url,
         user_query=user_query,
-        dry_run=True,
         cleanup_browser=True,
     )
 

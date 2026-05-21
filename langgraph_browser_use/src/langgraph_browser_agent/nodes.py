@@ -11,6 +11,7 @@ from .browser_pool import get_browser_pool, retry_async, shutdown_browser_pool
 from .config import (
     MAX_PAGES_TO_CRAWL,
     NAVIGATION_TIMEOUT_MS,
+    PAGE_LOAD_TIMEOUT_MS,
     WAIT_FOR_LOGIN_TIMEOUT,
     LOGIN_CHECK_INTERVAL,
 )
@@ -19,13 +20,15 @@ from .crawl import discover_and_crawl
 from .llm import analyze_with_llm
 from .logger import AuditLogger
 from .models import Agent1Output, PageCapture, PageContext, UIElement
+from .navigation_planner import plan_navigation
 from .prompts import SYSTEM_PROMPT
 from .security import assert_url_safe, SecurityError
 from .state import AgentState
 
 logger = logging.getLogger(__name__)
 
-# How many pages to crawl in focused mode (current page + minimal context)
+# Max pages to capture in hybrid mode (current + workflow steps)
+MAX_WORKFLOW_PAGES = int(__import__("os").getenv("MAX_WORKFLOW_PAGES", "6"))
 FOCUSED_CRAWL_LIMIT = int(__import__("os").getenv("FOCUSED_CRAWL_LIMIT", "3"))
 
 
@@ -161,20 +164,19 @@ def _filter_dom_for_llm(dom_summary: dict, is_primary_page: bool = False) -> dic
     return filtered
 
 
-# ─── Main Node: Navigate & Capture Current Page ──────────────────────────────
+# ─── Main Node: Navigate & Capture (Hybrid Mode) ─────────────────────────────
 
 async def navigate_and_crawl(state: AgentState) -> dict:
-    """Navigate to the user's current page and capture it.
-    Focused mode: captures current page + minimal related pages only if needed.
+    """Hybrid navigation: captures current page, then uses LLM to plan and
+    execute workflow navigation steps for multi-page capture.
     """
     url = state["url"]
     session_id = str(int(time.time()))
     audit = AuditLogger(session_id)
 
-    logger.info(f"Starting focused page analysis: {url}")
+    logger.info(f"Starting hybrid page analysis: {url}")
     audit.log("session_start", {"url": url, "query": state["user_query"]})
 
-    # Security: validate URL
     try:
         assert_url_safe(url)
     except SecurityError as e:
@@ -183,14 +185,12 @@ async def navigate_and_crawl(state: AgentState) -> dict:
         audit.save()
         return {"page_captures": []}
 
-    # Reset cost tracker
     reset_session()
-
     pool = get_browser_pool()
+
     try:
         context, page = await pool.acquire()
 
-        # Navigate to target URL
         async def _navigate():
             await page.goto(url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
 
@@ -202,7 +202,7 @@ async def navigate_and_crawl(state: AgentState) -> dict:
             logger.warning(f"Initial navigation issue: {e}")
             audit.log("navigation_error", {"error": str(e)})
 
-        # Check login state
+        # Handle login
         current_url = page.url
         if _is_app_url(current_url):
             logger.info("Already logged in, skipping login wait.")
@@ -211,10 +211,10 @@ async def navigate_and_crawl(state: AgentState) -> dict:
             logger.info("Login page detected. Please complete login + 2FA in the browser.")
             await _wait_for_login(page, audit)
 
-        # ─── FOCUSED CAPTURE: Current page is the priority ────────────────
+        # ─── HYBRID CAPTURE ───────────────────────────────────────────────
         captures = []
 
-        # 1. Always capture the current page (this is what the user sees)
+        # Step 1: Capture the current page (always)
         primary_capture = await capture_page(page, 1)
         if primary_capture:
             captures.append(primary_capture)
@@ -223,14 +223,12 @@ async def navigate_and_crawl(state: AgentState) -> dict:
                 "title": primary_capture.title,
             })
 
-        # 2. Only crawl additional pages if FOCUSED_CRAWL_LIMIT > 1
-        #    and the task might require seeing related pages
-        if FOCUSED_CRAWL_LIMIT > 1 and captures:
-            additional = await _capture_related_pages(
-                page, captures[0], state["user_query"], audit,
-                max_extra=FOCUSED_CRAWL_LIMIT - 1,
+        # Step 2: LLM-driven workflow navigation (captures additional pages)
+        if primary_capture:
+            workflow_captures = await _execute_workflow_navigation(
+                page, primary_capture, state["user_query"], audit,
             )
-            captures.extend(additional)
+            captures.extend(workflow_captures)
 
     except Exception as e:
         logger.error(f"Browser operation failed: {e}")
@@ -243,84 +241,197 @@ async def navigate_and_crawl(state: AgentState) -> dict:
     return {"page_captures": captures}
 
 
-async def _capture_related_pages(
+# ─── Hybrid Navigation Executor ──────────────────────────────────────────────
+
+async def _execute_workflow_navigation(
     page: Page,
     primary: PageCapture,
     user_query: str,
     audit: AuditLogger,
-    max_extra: int = 2,
 ) -> list[PageCapture]:
-    """Capture 1-2 related pages only if the user's query implies navigation.
-    For example: if user asks 'how to create a contract' and they're on the list view,
-    we might capture the 'New Contract' form page too.
-    """
-    from .config import PAGE_LOAD_TIMEOUT_MS
-    from .security import filter_crawl_url
-
+    """Use LLM navigation planner to walk through the workflow and capture each page."""
     extra_captures = []
-    query_lower = user_query.lower()
 
-    # Keywords that suggest the user needs to navigate to a creation/action page
-    action_keywords = ["create", "new", "add", "send", "submit", "approve", "sign", "edit"]
-    needs_action_page = any(kw in query_lower for kw in action_keywords)
-
-    if not needs_action_page:
+    try:
+        plan = await plan_navigation(
+            user_query=user_query,
+            page_title=primary.title,
+            page_url=primary.url,
+            dom_summary=primary.dom_summary,
+        )
+    except Exception as e:
+        logger.warning(f"Navigation planner failed: {e}")
         return extra_captures
 
-    # Look for a relevant "New" or action button/link in the current page DOM
-    nav_links = primary.dom_summary.get("navigation", [])
-    buttons = primary.dom_summary.get("buttons", [])
-    base_domain = primary.url.split("/")[2]
+    if not plan.get("needs_navigation"):
+        logger.info("Navigation Planner: No additional navigation needed.")
+        return extra_captures
 
-    # Find links that match the user's intent
-    target_urls = []
-    for link in nav_links:
-        if not isinstance(link, dict):
-            continue
-        href = link.get("href", "")
-        text = link.get("text", "").lower()
-        if not href or not filter_crawl_url(href, base_domain):
-            continue
-        # Match link text to query keywords
-        if any(kw in text for kw in action_keywords):
-            target_urls.append(href)
+    steps = plan.get("steps", [])
+    max_steps = min(len(steps), MAX_WORKFLOW_PAGES - 1)
+    logger.info(f"Navigation Planner: Executing {max_steps} navigation steps...")
 
-    # Capture at most max_extra related pages
-    visited = {primary.url.split("?")[0].rstrip("/")}
-    for target_url in target_urls[:max_extra]:
-        normalized = target_url.split("?")[0].rstrip("/")
-        if normalized in visited:
-            continue
-        visited.add(normalized)
+    for i, step in enumerate(steps[:max_steps]):
+        action = step.get("action", "")
+        target = step.get("target", "")
+        description = step.get("description", "")
+        wait_after = step.get("wait_after", 2)
+
+        logger.info(f"  Step {i+1}/{max_steps}: {description} [{action}: {target[:60]}]")
+        audit.log("workflow_step", {"step": i+1, "action": action, "target": target[:80]})
 
         try:
-            logger.info(f"Capturing related page: {target_url[:80]}")
-            audit.log("navigating_related", {"url": target_url})
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT_MS)
-            await asyncio.sleep(2)
+            navigated = await _execute_single_step(page, action, target)
+            if not navigated:
+                logger.warning(f"  Step {i+1}: Could not execute, skipping.")
+                audit.log("workflow_step_skipped", {"step": i+1, "reason": "element_not_found"})
+                continue
+
+            await asyncio.sleep(wait_after)
 
             cap = await capture_page(page, len(extra_captures) + 2)
             if cap:
                 extra_captures.append(cap)
-                audit.log("related_page_captured", {"url": cap.url, "title": cap.title})
+                audit.log("workflow_page_captured", {
+                    "step": i+1,
+                    "url": cap.url,
+                    "title": cap.title,
+                })
+                logger.info(f"  Step {i+1}: Captured -> {cap.title}")
+            else:
+                logger.warning(f"  Step {i+1}: Page capture returned None (error page?)")
+
         except Exception as e:
-            logger.warning(f"Failed to capture related page: {e}")
-            audit.log("related_page_error", {"url": target_url, "error": str(e)})
+            logger.warning(f"  Step {i+1}: Failed - {e}")
+            audit.log("workflow_step_error", {"step": i+1, "error": str(e)})
+            continue
 
-    # Navigate back to the original page so user's view is preserved
-    if extra_captures:
-        try:
-            await page.goto(primary.url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT_MS)
-        except Exception:
-            pass
-
+    logger.info(f"Hybrid navigation complete: {len(extra_captures)} additional pages captured.")
     return extra_captures
+
+
+async def _execute_single_step(page: Page, action: str, target: str) -> bool:
+    """Execute a single navigation step. Returns True if successful."""
+    if action == "goto_url":
+        await page.goto(target, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT_MS)
+        return True
+
+    if action == "click_nav":
+        return await _click_element_by_text(page, target, element_type="link")
+
+    if action == "click_button":
+        return await _click_element_by_text(page, target, element_type="button")
+
+    logger.warning(f"Unknown action type: {action}")
+    return False
+
+
+async def _click_element_by_text(page: Page, text: str, element_type: str = "link") -> bool:
+    """Find and click an element by its visible text. Tries multiple strategies."""
+    text_clean = text.strip()
+    url_before = page.url
+
+    selectors = []
+    if element_type == "link":
+        selectors = [
+            f'a:has-text("{text_clean}")',
+            f'[role="link"]:has-text("{text_clean}")',
+            f'nav a:has-text("{text_clean}")',
+            f'one-app-nav-bar-item-root:has-text("{text_clean}")',
+        ]
+    elif element_type == "button":
+        selectors = [
+            f'button:has-text("{text_clean}")',
+            f'[role="button"]:has-text("{text_clean}")',
+            f'input[value="{text_clean}"]',
+            f'a:has-text("{text_clean}")',
+        ]
+
+    clicked = False
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if await locator.is_visible(timeout=3000):
+                await locator.click(timeout=5000)
+                clicked = True
+                break
+        except Exception:
+            continue
+
+    # Fallback: case-insensitive JS click
+    if not clicked:
+        escaped_text = text_clean.replace('"', '\\"')
+        clicked = await page.evaluate("""(targetText) => {
+            const target = targetText.toLowerCase();
+            const elements = document.querySelectorAll('a, button, [role="button"], [role="link"], [role="tab"], one-app-nav-bar-item-root');
+            for (const el of elements) {
+                const elText = (el.textContent || el.getAttribute('title') || '').trim().toLowerCase();
+                if (elText === target || elText.includes(target)) {
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        }""", escaped_text)
+
+    if not clicked:
+        return False
+
+    # Wait for result — either page navigation OR modal/dialog appearing
+    await _wait_for_page_change_or_modal(page, url_before)
+    return True
+
+
+async def _wait_for_page_change_or_modal(page: Page, url_before: str) -> None:
+    """After a click, wait for either a URL change (navigation) or a modal/dialog to appear.
+    Salesforce Lightning often opens forms as modals without URL change.
+    """
+    # First, give a brief moment for any navigation to start
+    await asyncio.sleep(1)
+
+    # Check if URL changed (real navigation happened)
+    if page.url != url_before:
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=PAGE_LOAD_TIMEOUT_MS)
+        except Exception:
+            await asyncio.sleep(2)
+        return
+
+    # URL didn't change — likely a modal/dialog opened. Wait for it to render.
+    modal_selectors = [
+        '[role="dialog"]',
+        '.modal-container',
+        '.slds-modal',
+        '.slds-modal__container',
+        'section[role="dialog"]',
+        '.forceModalContainer',
+        '.uiModal',
+        '.panel-content',
+        'records-record-layout-event-broker',
+    ]
+
+    for attempt in range(10):  # Wait up to 5 seconds (10 * 0.5s)
+        for selector in modal_selectors:
+            try:
+                locator = page.locator(selector).first
+                if await locator.is_visible(timeout=200):
+                    # Modal found — give it extra time to fully render
+                    await asyncio.sleep(1.5)
+                    logger.info(f"  Modal/dialog detected: {selector}")
+                    return
+            except Exception:
+                continue
+        await asyncio.sleep(0.5)
+
+    # Neither navigation nor modal detected — wait a bit and proceed
+    await asyncio.sleep(2)
+    logger.info("  No navigation or modal detected, proceeding with current state.")
 
 
 # ─── Main Node: Analyze & Generate Output ─────────────────────────────────────
 
 async def analyze_and_generate_output(state: AgentState) -> dict:
-    """Analyze the current page with LLM and produce task-specific guidance."""
+    """Analyze captured pages with LLM and produce task-specific guidance."""
     captures = state["page_captures"] or []
     user_query = state["user_query"]
 
@@ -340,14 +451,15 @@ async def analyze_and_generate_output(state: AgentState) -> dict:
             )
         }
 
-    # Build the LLM input — primary page gets full detail, others get minimal
+    # Build the LLM input — primary page gets full detail, others get workflow context
     primary = captures[0]
     pages_data = []
 
     for i, cap in enumerate(captures):
         is_primary = (i == 0)
+        page_role = "CURRENT_PAGE (user is looking at this right now)" if is_primary else f"WORKFLOW_STEP_{i} (navigated to during workflow)"
         pages_data.append({
-            "page_role": "CURRENT_PAGE (user is looking at this right now)" if is_primary else "RELATED_PAGE",
+            "page_role": page_role,
             "url": cap.url,
             "title": cap.title,
             "dom": _filter_dom_for_llm(cap.dom_summary, is_primary_page=is_primary),
@@ -360,23 +472,35 @@ async def analyze_and_generate_output(state: AgentState) -> dict:
     est_tokens = estimate_tokens(pages_json)
     logger.info(f"Input to LLM: ~{est_tokens} tokens for {len(captures)} pages")
 
-    # Construct a focused user message that emphasizes the current screen
+    # Construct user message with multi-page context
+    multi_page_note = ""
+    if len(captures) > 1:
+        multi_page_note = (
+            f"\n\n## Navigation Context\n"
+            f"The system navigated through {len(captures)} pages to capture the full workflow. "
+            f"Use ALL captured pages to provide accurate, detailed step-by-step guidance. "
+            f"Each WORKFLOW_STEP page represents what the user will see after performing that action.\n"
+        )
+
     user_message = (
         f"## User's Question\n"
         f"\"{user_query}\"\n\n"
         f"## Current Screen\n"
-        f"The user is currently on: \"{primary.title}\" ({primary.url})\n\n"
-        f"## Page Data\n"
+        f"The user is currently on: \"{primary.title}\" ({primary.url})\n"
+        f"{multi_page_note}\n"
+        f"## Page Data ({len(captures)} pages captured)\n"
         f"{pages_json}\n\n"
         f"## Instructions\n"
         f"Answer the user's question with step-by-step guidance starting from their CURRENT page.\n"
-        f"The context_for_video field must be a complete narration script (200-400 words) "
+        f"The context_for_video field must be a complete narration script (200-500 words) "
         f"that starts with 'You are currently on the {primary.title} page...' and walks through "
         f"every click and screen transition needed to complete the task.\n"
+        f"Use the actual page data from each workflow step to describe what the user will see "
+        f"at each stage — real button names, real form fields, real page titles.\n"
         f"Respond with JSON matching the schema in your system instructions."
     )
 
-    # Use mini model only for very simple single-page queries
+    # Use full model when we have multi-page data for richer output
     use_mini = len(captures) == 1 and est_tokens < 2000
 
     try:

@@ -48,5 +48,12 @@ class Settings(BaseSettings):
     sdk_generation_timeout: int = 600
     sdk_poll_interval: float = 1.0
 
+    # Tutorial / CLM-specific settings
+    min_tutorial_steps: int = 4
+    max_tutorial_steps: int = 8
+    default_clip_duration: int = 6
+    tutorial_aspect_ratio: str = "16:9"
+    prompt_style: str = "beginner_friendly"
+
 
 settings = Settings()
