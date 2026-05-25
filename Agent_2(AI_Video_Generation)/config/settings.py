@@ -10,11 +10,10 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Resolve .env path relative to video_pipeline/ root (one level up from config/)
+# Resolve paths relative to Agent 2 project root (one level up from config/)
 _VIDEO_PIPELINE_DIR = Path(__file__).resolve().parent.parent
 _ENV_FILE = _VIDEO_PIPELINE_DIR / ".env"
-_PROJECT_ROOT = _VIDEO_PIPELINE_DIR.parent / "langgraph_browser_use"
-_GENERATED_VIDEOS_DIR = _PROJECT_ROOT / "generated_videos"
+_GENERATED_VIDEOS_DIR = _VIDEO_PIPELINE_DIR / "output" / "generated_videos"
 
 
 class Settings(BaseSettings):

@@ -1,52 +1,15 @@
-# agent2.py — Video Generation Agent (Agent 2)
-# Takes Agent1Output + user_query → generates optimized prompts → produces tutorial video
+# agent2.py — Legacy Agent 2 integration (DEPRECATED)
+# The active integration now lives in pipeline.py which calls Agent_2(AI_Video_Generation)/generate_tutorial.py
+# This file is kept only for reference of the LLM prompt engineering approach.
+# TODO: Remove this file once the edit-video pipeline is fully stable.
 
 import json
 import logging
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from .llm import analyze_with_llm
 
 logger = logging.getLogger(__name__)
-
-# Output directory for generated videos and metadata
-GENERATED_VIDEOS_DIR = Path(__file__).resolve().parents[3] / "langgraph_browser_use" / "generated_videos"
-
-# Add video_pipeline to path for imports
-VIDEO_PIPELINE_DIR = Path(__file__).resolve().parents[3] / "video_pipeline"
-if str(VIDEO_PIPELINE_DIR) not in sys.path:
-    sys.path.insert(0, str(VIDEO_PIPELINE_DIR))
-
-def _import_video_pipeline():
-    """Import run_pipeline from video_pipeline with proper path isolation."""
-    import importlib.util
-
-    workflow_path = VIDEO_PIPELINE_DIR / "graph" / "workflow.py"
-    if not workflow_path.exists():
-        raise ImportError(
-            f"Video pipeline not found at {workflow_path}. "
-            f"Ensure video_pipeline/ is in the project root."
-        )
-
-    video_path_str = str(VIDEO_PIPELINE_DIR)
-    was_in_path = video_path_str in sys.path
-    if not was_in_path:
-        sys.path.insert(0, video_path_str)
-
-    try:
-        spec = importlib.util.spec_from_file_location(
-            "video_pipeline.graph.workflow", str(workflow_path)
-        )
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module.run_pipeline
-    finally:
-        if not was_in_path:
-            sys.path.remove(video_path_str)
-
 
 AGENT2_SYSTEM_PROMPT = """\
 You are a video prompt engineer for Foxio — an AI that creates beginner-friendly tutorial videos for SaaS platforms.

@@ -10,6 +10,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+# Add src to path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
 # Load .env from project root
 env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)

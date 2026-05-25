@@ -9,15 +9,20 @@ load_dotenv()
 
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
+# All paths are anchored to the Agent 1 project root (2 levels up from this file)
+# This ensures folders are ALWAYS created inside Agent_1/ regardless of CWD.
 
-BASE_DIR = Path(os.getenv("BASE_DIR", "."))
-SCREENSHOTS_DIR = Path(os.getenv("SCREENSHOTS_DIR", "screenshots"))
-BROWSER_DATA_DIR = Path(os.getenv("BROWSER_DATA_DIR", "browser_data"))
-CACHE_DIR = Path(os.getenv("CACHE_DIR", "cache"))
-COST_LOG_DIR = Path(os.getenv("COST_LOG_DIR", "logs"))
-AUDIT_LOG_DIR = Path(os.getenv("AUDIT_LOG_DIR", "logs/audit"))
-AGENT_OUTPUT_DIR = Path(os.getenv("AGENT_OUTPUT_DIR", "logs/agent_output"))
-VIDEO_CLIPS_DIR = Path(os.getenv("VIDEO_CLIPS_DIR", "video_clips"))
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent  # Agent_1(browser_use+Playwright)/
+_DATA_DIR = _PROJECT_ROOT / ".data"
+
+BASE_DIR = _PROJECT_ROOT
+SCREENSHOTS_DIR = _DATA_DIR / "screenshots"
+BROWSER_DATA_DIR = _DATA_DIR / "browser_data"
+CACHE_DIR = _DATA_DIR / "cache"
+COST_LOG_DIR = _DATA_DIR / "logs"
+AUDIT_LOG_DIR = _DATA_DIR / "logs" / "audit"
+AGENT_OUTPUT_DIR = _DATA_DIR / "logs" / "agent_output"
+VIDEO_CLIPS_DIR = _DATA_DIR / "video_clips"
 
 # Ensure directories exist
 for d in [SCREENSHOTS_DIR, BROWSER_DATA_DIR, CACHE_DIR, COST_LOG_DIR, AUDIT_LOG_DIR, AGENT_OUTPUT_DIR, VIDEO_CLIPS_DIR]:

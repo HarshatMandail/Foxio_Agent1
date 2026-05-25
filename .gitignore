@@ -18,17 +18,6 @@ venv/
 .venv/
 env/
 
-# Browser data (runtime generated)
-browser_data/
-cache/
-logs/
-screenshots/
-output/
-
-# Generated videos (keep .gitkeep only)
-**/generated_videos/*
-!**/generated_videos/.gitkeep
-
 # IDE
 .vscode/
 .idea/
@@ -41,7 +30,4 @@ Thumbs.db
 
 # Misc
 *.log
-debug.log
-info.log
-*.gif
 .langgraph_api/

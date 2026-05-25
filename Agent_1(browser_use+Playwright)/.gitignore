@@ -138,7 +138,8 @@ dmypy.json
 .DS_Store
 Thumbs.db
 
-# Project specific
+# Project specific — all runtime data lives in .data/
+.data/
 debug.log
 info.log
 *.gif
@@ -147,6 +148,7 @@ browser_data/
 cache/
 logs/
 output/
+video_clips/
 
 # Generated videos (keep .gitkeep only)
 generated_videos/*
