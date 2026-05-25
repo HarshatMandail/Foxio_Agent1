@@ -15,6 +15,7 @@ from .models import Agent1Output, PageContext, UIElement, PageCapture, VideoClip
 from .navigation_planner import plan_navigation
 from .pipeline import run_full_pipeline
 from .state import AgentState
+from .video_converter import convert_all_clips, convert_webm_to_mp4
 
 __all__ = [
     "run_full_pipeline",
@@ -27,6 +28,8 @@ __all__ = [
     "PageCapture",
     "VideoClip",
     "AgentState",
+    "convert_all_clips",
+    "convert_webm_to_mp4",
     "create_agent1_graph",
     "get_azure_client",
     "analyze_with_llm",

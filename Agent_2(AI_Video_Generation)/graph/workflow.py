@@ -1,13 +1,14 @@
 """
 LangGraph StateGraph workflow for the video generation pipeline.
 
-Edit-Video only — linear pipeline with no routing.
+Pipeline: enqueue → split → process (animate + extend-video) → concatenate → finalize
 
-Nodes:
-  1. enqueue_clips — Validate inputs and prepare for generation
-  2. generate_clips — Enhance all clips using edit-video mode
-  3. concatenate_clips — Merge successful clips into final video
-  4. finalize — Cleanup temp files and return metadata
+Strategy:
+  1. Take the single merged raw .mp4 from Agent 1
+  2. Split into ≤8.0s clips (Grok API limit)
+  3. Process sequentially: clip 0 = animate, clips 1+ = extend-video
+  4. Concatenate all enhanced clips into final smooth video
+  5. Cleanup temp files
 """
 
 import asyncio
@@ -19,179 +20,198 @@ from loguru import logger
 
 from config.settings import settings
 from nodes.utils import cleanup_clips, cleanup_preprocessed, concatenate_clips, ensure_directories
-from nodes.video_generator import generate_all_clips
-
-
-# --- State Schema ---
+from nodes.video_splitter import split_video_into_clips
+from nodes.video_processor import process_clips_sequentially
 
 
 class PipelineState(TypedDict):
     """State passed between LangGraph nodes."""
 
     job_id: str
-    video_clips: list[dict[str, Any]]
+    raw_video_path: str
+    user_prompt: str
+    platform_name: str
+    clips: list[dict[str, Any]]
     clip_results: list[dict[str, Any]]
     final_video_path: str
     status: str
     error: str
 
 
-# --- Node Functions ---
-
-
-def node_enqueue_clips(state: PipelineState) -> dict[str, Any]:
-    """Node 1: Validate video clips and prepare for generation."""
+def node_enqueue(state: PipelineState) -> dict[str, Any]:
+    """Node 1: Validate input and prepare directories."""
     job_id = state.get("job_id") or str(uuid.uuid4())[:8]
     ensure_directories()
 
-    video_clips = state.get("video_clips", [])
-    valid_clips = [c for c in video_clips if c.get("video_path")]
+    raw_video = state.get("raw_video_path", "")
+    user_prompt = state.get("user_prompt", "")
 
-    logger.info(
-        f"[Job {job_id}] Pipeline started | "
-        f"{len(valid_clips)} video clips to process"
-    )
+    logger.info(f"[Job {job_id}] Pipeline started | raw_video={raw_video}")
 
-    if not valid_clips:
-        logger.error(f"[Job {job_id}] No valid video clips provided.")
+    if not raw_video:
         return {
             "job_id": job_id,
             "status": "failed",
-            "error": "No valid video clips provided. Each clip must have a video_path.",
+            "error": "No raw_video_path provided.",
+        }
+
+    from pathlib import Path
+    if not Path(raw_video).exists():
+        return {
+            "job_id": job_id,
+            "status": "failed",
+            "error": f"Raw video file not found: {raw_video}",
         }
 
     return {
         "job_id": job_id,
-        "video_clips": valid_clips,
-        "status": "generating",
+        "status": "splitting",
     }
 
 
-def node_generate_clips(state: PipelineState) -> dict[str, Any]:
-    """Node 2: Generate all enhanced clips using edit-video mode."""
-    video_clips = state.get("video_clips", [])
-    job_id = state["job_id"]
-
+def node_split(state: PipelineState) -> dict[str, Any]:
+    """Node 2: Split raw video into ≤8.0s clips."""
     if state.get("status") == "failed":
-        return {"clip_results": [], "status": "failed"}
+        return {"clips": []}
 
-    logger.info(f"[Job {job_id}] Generating {len(video_clips)} clips with Edit-Video mode...")
+    job_id = state["job_id"]
+    raw_video = state["raw_video_path"]
+
+    logger.info(f"[Job {job_id}] Splitting raw video into clips...")
+
+    try:
+        clips = split_video_into_clips(
+            raw_video_path=raw_video,
+            output_dir=settings.clip_output_dir,
+            max_seconds=8.0,
+        )
+    except RuntimeError as e:
+        logger.error(f"[Job {job_id}] Splitting failed: {e}")
+        return {"clips": [], "status": "failed", "error": str(e)}
+
+    if not clips:
+        return {"clips": [], "status": "failed", "error": "Splitting produced no clips."}
+
+    logger.info(f"[Job {job_id}] Split into {len(clips)} clips")
+    return {"clips": clips, "status": "processing"}
+
+
+def node_process(state: PipelineState) -> dict[str, Any]:
+    """Node 3: Process clips sequentially (animate first, extend rest)."""
+    if state.get("status") == "failed":
+        return {"clip_results": []}
+
+    job_id = state["job_id"]
+    clips = state.get("clips", [])
+    user_prompt = state.get("user_prompt", "")
+    platform_name = state.get("platform_name", "Salesforce")
+
+    logger.info(f"[Job {job_id}] Processing {len(clips)} clips (animate + extend-video)...")
 
     async def _run() -> list[dict[str, Any]]:
-        return await generate_all_clips(video_clips=video_clips)
+        return await process_clips_sequentially(
+            clips=clips,
+            user_prompt=user_prompt,
+            platform_name=platform_name,
+        )
 
     import concurrent.futures
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(asyncio.run, _run())
         clip_results = future.result()
 
-    successful = [r for r in clip_results if r["status"] in ("success", "dry_run")]
-    failed = [r for r in clip_results if r["status"] == "failed"]
+    successful = sum(1 for r in clip_results if r["status"] in ("success", "dry_run"))
+    failed = sum(1 for r in clip_results if r["status"] == "failed")
 
-    logger.info(
-        f"[Job {job_id}] Generation complete | "
-        f"success={len(successful)} | failed={len(failed)}"
-    )
+    logger.info(f"[Job {job_id}] Processing complete | success={successful} | failed={failed}")
 
     return {"clip_results": clip_results, "status": "concatenating"}
 
 
 def node_concatenate(state: PipelineState) -> dict[str, Any]:
-    """Node 3: Concatenate all successful clips into one final video."""
+    """Node 4: Concatenate all enhanced clips into final video."""
     job_id = state["job_id"]
     clip_results = state.get("clip_results", [])
 
     if state.get("status") == "failed":
         return {"final_video_path": "", "status": "failed"}
 
-    # In dry_run mode, skip concatenation (no real files exist)
     if any(r["status"] == "dry_run" for r in clip_results):
         logger.info(f"[Job {job_id}] Dry run — skipping concatenation.")
         return {"final_video_path": "dry_run_no_output", "status": "finalizing"}
 
     successful_paths = [
         r["path"]
-        for r in sorted(clip_results, key=lambda x: x["step_index"])
+        for r in sorted(clip_results, key=lambda x: x["clip_index"])
         if r["status"] == "success"
     ]
 
     if not successful_paths:
         logger.error(f"[Job {job_id}] No successful clips to concatenate.")
-        return {
-            "status": "failed",
-            "error": "All clip generations failed. No video produced.",
-            "final_video_path": "",
-        }
+        return {"status": "failed", "error": "All clips failed.", "final_video_path": ""}
 
     try:
         final_path = concatenate_clips(successful_paths, job_id)
         return {"final_video_path": str(final_path), "status": "finalizing"}
     except RuntimeError as e:
         logger.error(f"[Job {job_id}] Concatenation failed: {e}")
-        return {
-            "status": "failed",
-            "error": str(e),
-            "final_video_path": "",
-        }
+        return {"status": "failed", "error": str(e), "final_video_path": ""}
 
 
 def node_finalize(state: PipelineState) -> dict[str, Any]:
-    """Node 4: Cleanup temp files and return final metadata."""
+    """Node 5: Cleanup temp files."""
     job_id = state["job_id"]
-
     cleanup_clips()
     cleanup_preprocessed()
 
-    logger.success(
-        f"[Job {job_id}] Pipeline complete | "
-        f"final_video={state.get('final_video_path', 'none')}"
-    )
-
+    logger.success(f"[Job {job_id}] Pipeline complete | video={state.get('final_video_path')}")
     return {"status": "completed", "error": ""}
 
 
-# --- Graph Builder ---
-
-
 def build_pipeline_graph() -> StateGraph:
-    """Build and compile the LangGraph video generation pipeline.
-
-    Linear graph: enqueue → generate → concatenate → finalize
-    """
+    """Build the LangGraph pipeline: enqueue → split → process → concat → finalize."""
     graph = StateGraph(PipelineState)
 
-    graph.add_node("enqueue_clips", node_enqueue_clips)
-    graph.add_node("generate_clips", node_generate_clips)
-    graph.add_node("concatenate_clips", node_concatenate)
+    graph.add_node("enqueue", node_enqueue)
+    graph.add_node("split", node_split)
+    graph.add_node("process", node_process)
+    graph.add_node("concatenate", node_concatenate)
     graph.add_node("finalize", node_finalize)
 
-    graph.set_entry_point("enqueue_clips")
-    graph.add_edge("enqueue_clips", "generate_clips")
-    graph.add_edge("generate_clips", "concatenate_clips")
-    graph.add_edge("concatenate_clips", "finalize")
+    graph.set_entry_point("enqueue")
+    graph.add_edge("enqueue", "split")
+    graph.add_edge("split", "process")
+    graph.add_edge("process", "concatenate")
+    graph.add_edge("concatenate", "finalize")
     graph.add_edge("finalize", END)
 
     return graph.compile()
 
 
 async def run_pipeline(
-    video_clips: list[dict[str, Any]],
+    raw_video_path: str,
+    user_prompt: str = "",
+    platform_name: str = "Salesforce",
     job_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Execute the full video generation pipeline.
 
     Args:
-        video_clips: Real browser recordings from Agent 1.
-            Each dict must have: step, video_path, narration, action.
-        job_id: Optional custom job ID for tracking.
+        raw_video_path: Path to the single merged .mp4 from Agent 1.
+        user_prompt: Enhancement/animation prompt for the video.
+        platform_name: Platform name for prompt context.
+        job_id: Optional custom job ID.
 
     Returns:
         Final pipeline state with video path and metadata.
     """
     initial_state: PipelineState = {
         "job_id": job_id or str(uuid.uuid4())[:8],
-        "video_clips": video_clips or [],
+        "raw_video_path": raw_video_path,
+        "user_prompt": user_prompt,
+        "platform_name": platform_name,
+        "clips": [],
         "clip_results": [],
         "final_video_path": "",
         "status": "pending",
@@ -199,6 +219,4 @@ async def run_pipeline(
     }
 
     pipeline = build_pipeline_graph()
-    final_state = pipeline.invoke(initial_state)
-
-    return final_state
+    return pipeline.invoke(initial_state)

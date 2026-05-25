@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     retry_base_delay: float = 2.0
     clip_output_dir: Path = _GENERATED_VIDEOS_DIR / "clips"
     final_output_dir: Path = _GENERATED_VIDEOS_DIR
-    max_clip_duration: int = 5  # Hard cap at 5s — less time = less hallucination
+    max_clip_duration: int = 8  # Grok API hard limit is ~8.7s, we use 8.0s for safety
     log_level: str = "INFO"
 
     # Dry run mode — logs prompts without making API calls (saves credits)
