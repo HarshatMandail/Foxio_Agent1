@@ -51,6 +51,8 @@ async def run_agent1(
         "user_query": user_query,
         "page_captures": None,
         "structured_output": None,
+        "task_completed": None,
+        "trim_start_seconds": 0,
     }
 
     try:

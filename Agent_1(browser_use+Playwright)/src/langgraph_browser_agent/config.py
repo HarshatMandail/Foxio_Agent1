@@ -23,9 +23,10 @@ COST_LOG_DIR = _DATA_DIR / "logs"
 AUDIT_LOG_DIR = _DATA_DIR / "logs" / "audit"
 AGENT_OUTPUT_DIR = _DATA_DIR / "logs" / "agent_output"
 VIDEO_CLIPS_DIR = _DATA_DIR / "video_clips"
+OUTPUT_DIR = _PROJECT_ROOT / "output"
 
 # Ensure directories exist
-for d in [SCREENSHOTS_DIR, BROWSER_DATA_DIR, CACHE_DIR, COST_LOG_DIR, AUDIT_LOG_DIR, AGENT_OUTPUT_DIR, VIDEO_CLIPS_DIR]:
+for d in [SCREENSHOTS_DIR, BROWSER_DATA_DIR, CACHE_DIR, COST_LOG_DIR, AUDIT_LOG_DIR, AGENT_OUTPUT_DIR, VIDEO_CLIPS_DIR, OUTPUT_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 
@@ -51,10 +52,17 @@ CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "21600"))
 
 HEADLESS = os.getenv("BROWSER_USE_HEADLESS", "false").lower() == "true"
 BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "")
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+SLOW_MO = int(os.getenv("SLOW_MO", "100")) if os.getenv("DEBUG_MODE", "false").lower() == "true" else 0
 NAVIGATION_TIMEOUT_MS = int(os.getenv("NAVIGATION_TIMEOUT_MS", "30000"))
 PAGE_LOAD_TIMEOUT_MS = int(os.getenv("PAGE_LOAD_TIMEOUT_MS", "15000"))
 WAIT_FOR_LOGIN_TIMEOUT = int(os.getenv("WAIT_FOR_LOGIN_TIMEOUT", "300"))
 LOGIN_CHECK_INTERVAL = int(os.getenv("LOGIN_CHECK_INTERVAL", "3"))
+BROWSER_USER_AGENT = os.getenv(
+    "BROWSER_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+)
 
 
 # ─── Security ─────────────────────────────────────────────────────────────────

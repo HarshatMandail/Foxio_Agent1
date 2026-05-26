@@ -10,8 +10,8 @@ All methods include robust upload with 3-attempt retry and exponential backoff.
 """
 
 import asyncio
+import base64
 import mimetypes
-import time
 from pathlib import Path
 from typing import Any
 
@@ -21,19 +21,16 @@ from xai_sdk import Client
 
 from adapters.base import VideoGenerationService
 from config.settings import settings
-from core.registry import VideoModel
 
 SUPPORTED_ASPECT_RATIOS = {"1:1", "16:9", "9:16"}
 SUPPORTED_RESOLUTIONS = {"480p", "720p"}
 
-UPLOAD_MAX_RETRIES = 3
-UPLOAD_BASE_DELAY = 2.0
-UPLOAD_TIMEOUT = 120.0
-XAI_FILES_API_URL = "https://api.x.ai/v1/files"
-
 EDIT_VIDEO_PREFIX = (
-    "Enhance this real screen recording. Keep every UI element, text, button, "
-    "icon, and layout 100% identical to the original video. "
+    "You are creating a professional, beginner-friendly tutorial video. "
+    "EXACT VISUAL EDIT of this real screen recording. "
+    "Keep every UI element, text, button, icon, and layout 100% identical to the original video. "
+    "Only improve: mouse cursor smoothness, motion quality, and add natural voice-over narration. "
+    "Use a friendly, patient tutor voice that syncs with cursor movements. "
 )
 
 
@@ -198,28 +195,6 @@ class GrokAdapter(VideoGenerationService):
 
         return await self._execute_and_save(gen_kwargs, output_path, video_file, "edit-video")
 
-    # ─── Abstract interface implementation ────────────────────────────────────
-
-    async def generate(
-        self,
-        model: VideoModel,
-        prompt: str,
-        duration: int,
-        output_path: Path,
-        aspect_ratio: str = "16:9",
-        resolution: str = "480p",
-        start_image: str | None = None,
-        dry_run: bool = False,
-    ) -> dict[str, Any]:
-        """Base interface — delegates to generate_edit_video for compatibility."""
-        return await self.generate_edit_video(
-            input_video_path=str(output_path),
-            prompt=prompt,
-            duration=duration,
-            output_path=output_path,
-            dry_run=dry_run,
-        )
-
     # ─── Internal Helpers ─────────────────────────────────────────────────────
 
     def _build_gen_kwargs(
@@ -235,24 +210,14 @@ class GrokAdapter(VideoGenerationService):
         validated_ar = aspect_ratio if aspect_ratio in SUPPORTED_ASPECT_RATIOS else "16:9"
         validated_res = resolution if resolution in SUPPORTED_RESOLUTIONS else "480p"
 
-        gen_kwargs: dict[str, Any] = {
+        return {
             "model": "grok-imagine-video",
             "prompt": prompt,
-            "mode": mode,
             "duration": duration,
             "aspect_ratio": validated_ar,
             "resolution": validated_res,
+            "video_url": upload_result["reference"],
         }
-
-        reference = upload_result["reference"]
-        ref_type = upload_result["type"]
-
-        if ref_type == "url":
-            gen_kwargs["video_url"] = reference
-        else:
-            gen_kwargs["file_id"] = reference
-
-        return gen_kwargs
 
     async def _execute_and_save(
         self,
@@ -311,76 +276,21 @@ class GrokAdapter(VideoGenerationService):
     # ─── Upload with Retry ────────────────────────────────────────────────────
 
     async def _upload_video_file(self, video_path: Path) -> dict[str, str]:
-        """Upload video to xAI Files API with 3-attempt retry."""
+        """Encode video as base64 data URL for the xAI SDK.
+
+        The SDK accepts video_url as a base64-encoded data URL:
+        data:video/mp4;base64,<base64_data>
+        """
         mime_type = mimetypes.guess_type(str(video_path))[0] or "video/mp4"
         file_size_kb = video_path.stat().st_size // 1024
 
-        logger.info(f"[Upload] {video_path.name} ({file_size_kb}KB)")
+        logger.info(f"[Upload] Encoding {video_path.name} ({file_size_kb}KB) as base64 data URL")
 
-        last_error = ""
+        video_bytes = video_path.read_bytes()
+        b64 = base64.b64encode(video_bytes).decode("ascii")
+        data_url = f"data:{mime_type};base64,{b64}"
 
-        for attempt in range(1, UPLOAD_MAX_RETRIES + 1):
-            start_time = time.time()
-            try:
-                async with httpx.AsyncClient(timeout=UPLOAD_TIMEOUT) as http_client:
-                    headers = {"Authorization": f"Bearer {self._api_key}"}
-
-                    with open(video_path, "rb") as f:
-                        files = {
-                            "file": (video_path.name, f, mime_type),
-                            "purpose": (None, "video-edit"),
-                        }
-                        resp = await http_client.post(
-                            XAI_FILES_API_URL, headers=headers, files=files,
-                        )
-
-                elapsed = time.time() - start_time
-
-                if resp.status_code >= 400:
-                    last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
-                    logger.warning(f"[Upload] Attempt {attempt} failed: {last_error}")
-
-                    if 400 <= resp.status_code < 500 and resp.status_code != 429:
-                        raise RuntimeError(f"Upload client error: {last_error}")
-
-                    if attempt < UPLOAD_MAX_RETRIES:
-                        delay = UPLOAD_BASE_DELAY * (2 ** (attempt - 1))
-                        await asyncio.sleep(delay)
-                        continue
-                    raise RuntimeError(f"Upload failed after {UPLOAD_MAX_RETRIES} attempts: {last_error}")
-
-                result = resp.json()
-                reference, ref_type = self._resolve_upload_reference(result)
-                logger.info(f"[Upload] Success in {elapsed:.1f}s | {ref_type}={reference[:60]}")
-                return {"reference": reference, "type": ref_type}
-
-            except RuntimeError:
-                raise
-            except Exception as e:
-                last_error = str(e)
-                logger.warning(f"[Upload] Attempt {attempt} error: {last_error}")
-                if attempt < UPLOAD_MAX_RETRIES:
-                    await asyncio.sleep(UPLOAD_BASE_DELAY * (2 ** (attempt - 1)))
-
-        raise RuntimeError(f"Upload failed for {video_path.name}: {last_error}")
-
-    @staticmethod
-    def _resolve_upload_reference(api_response: dict) -> tuple[str, str]:
-        """Extract URL or file_id from upload response."""
-        url = api_response.get("url") or api_response.get("file_url")
-        if url and url.startswith("http"):
-            return url, "url"
-
-        file_id = api_response.get("id") or api_response.get("file_id")
-        if file_id:
-            return str(file_id), "file_id"
-
-        for key in ("url", "file_url", "id", "file_id", "object_id"):
-            value = api_response.get(key)
-            if value:
-                return str(value), "url" if "url" in key else "file_id"
-
-        raise RuntimeError(f"Cannot resolve reference from: {list(api_response.keys())}")
+        return {"reference": data_url}
 
     @staticmethod
     async def _download_video(url: str) -> bytes:

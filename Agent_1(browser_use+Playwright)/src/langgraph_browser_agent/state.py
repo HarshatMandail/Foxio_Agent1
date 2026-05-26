@@ -9,4 +9,5 @@ class AgentState(TypedDict):
     user_query: str
     page_captures: Optional[list[PageCapture]]
     structured_output: Optional[Agent1Output]
-    video_clips: Optional[list[dict]]
+    task_completed: Optional[bool]
+    trim_start_seconds: Optional[float]

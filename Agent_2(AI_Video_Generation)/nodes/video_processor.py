@@ -176,36 +176,57 @@ async def _process_with_retry(
 
 
 def _build_animate_prompt(user_prompt: str, platform_name: str, clip_index: int, total: int) -> str:
-    """Build the prompt for the first clip (animate mode)."""
+    """Build the prompt for the first clip (animate mode) — beginner-friendly tutorial style."""
     return (
-        f"EXACT EDIT of this real screen recording of {platform_name}. "
-        f"Keep EVERY UI element, text, button, icon, color, layout, font, and data "
-        f"100% IDENTICAL to the original video. "
-        f"DO NOT invent, change, move, add, remove, or hallucinate ANY visual element. "
-        f"Only allowed improvements: "
-        f"- Make mouse cursor smooth, realistic white arrow with subtle soft shadow. "
-        f"- Natural hover for 0.3 seconds then precise click. "
-        f"- Smooth 60fps motion, ultra sharp, professional clean SaaS tutorial style. "
-        f"{user_prompt} "
-        f"This is clip {clip_index + 1} of {total}. "
-        f"No creative freedom. No artifacts. No text overlays. No layout changes."
+        f"You are creating a professional, beginner-friendly tutorial video.\n\n"
+        f"EXACT VISUAL EDIT of this real screen recording from {platform_name}.\n"
+        f"- Keep EVERY UI element, text, button, icon, color, layout, font, and data "
+        f"100% IDENTICAL to the original video. No changes allowed to the interface.\n"
+        f"- Only improve: mouse cursor, motion smoothness, and add voice-over narration.\n\n"
+        f"STYLE REQUIREMENTS:\n"
+        f"- Friendly, clear, patient tutor voice (warm and encouraging tone)\n"
+        f'- Speak naturally like a real teacher: "Now click on the New button here...", '
+        f'"Next, let\'s fill in the First Name field...", "Great! Now select the Contacts tab..."\n'
+        f"- Voice-over must perfectly sync with the cursor movements\n"
+        f"- Cursor: Realistic white arrow with soft shadow. Move smoothly and naturally. "
+        f"Hover for 0.3-0.5 seconds on clickable elements before clicking.\n"
+        f'- When voice says "click here" or "select this", the cursor must move there '
+        f"and click at the exact same moment.\n"
+        f"- Smooth 60fps animation, ultra-sharp, clean modern SaaS tutorial style\n"
+        f"- No text overlays, no fake data, no layout changes\n\n"
+        f"Current step: {clip_index + 1} of {total}\n"
+        f"Context: {user_prompt}\n\n"
+        f"Generate this clip with realistic voice-over narration + perfectly synced cursor movements."
     )
 
 
 def _build_extend_prompt(user_prompt: str, platform_name: str, clip_index: int, total: int) -> str:
     """Build the prompt for extend-video mode (clips 1+).
 
-    Strong continuity constraints to prevent hallucination and style jumps.
+    Maintains the same beginner-friendly tutorial style with voice-over narration
+    while ensuring seamless visual continuity from the previous clip.
     """
     return (
-        f"CONTINUE EXACTLY from the last frame of the previous video segment. "
-        f"This is a seamless continuation of the same {platform_name} screen recording. "
-        f"The visual style, UI layout, colors, fonts, cursor style, and animation quality "
-        f"MUST be pixel-identical to the previous segment. "
-        f"DO NOT change any visual element, style, or introduce any discontinuity. "
-        f"Keep the same smooth 60fps motion, same cursor style, same professional quality. "
-        f"{user_prompt} "
-        f"This is clip {clip_index + 1} of {total} in a continuous recording. "
-        f"CRITICAL: The first frame of this clip must match the last frame of the previous clip exactly. "
-        f"No jumps. No style changes. No artifacts. Seamless continuation only."
+        f"You are creating a professional, beginner-friendly tutorial video.\n\n"
+        f"CONTINUE EXACTLY from the last frame of the previous video segment.\n"
+        f"This is a seamless continuation of the same {platform_name} screen recording.\n\n"
+        f"EXACT VISUAL EDIT:\n"
+        f"- Keep EVERY UI element, text, button, icon, color, layout, font, and data "
+        f"100% IDENTICAL to the original video. No changes allowed to the interface.\n"
+        f"- Only improve: mouse cursor, motion smoothness, and add voice-over narration.\n"
+        f"- The first frame of this clip MUST match the last frame of the previous clip exactly.\n\n"
+        f"STYLE REQUIREMENTS:\n"
+        f"- Friendly, clear, patient tutor voice (warm and encouraging tone)\n"
+        f'- Speak naturally like a real teacher: "Now click on the New button here...", '
+        f'"Next, let\'s fill in the First Name field...", "Great! Now select the Contacts tab..."\n'
+        f"- Voice-over must perfectly sync with the cursor movements\n"
+        f"- Cursor: Realistic white arrow with soft shadow. Move smoothly and naturally. "
+        f"Hover for 0.3-0.5 seconds on clickable elements before clicking.\n"
+        f'- When voice says "click here" or "select this", the cursor must move there '
+        f"and click at the exact same moment.\n"
+        f"- Smooth 60fps animation, ultra-sharp, clean modern SaaS tutorial style\n"
+        f"- No text overlays, no fake data, no layout changes\n\n"
+        f"Current step: {clip_index + 1} of {total}\n"
+        f"Context: {user_prompt}\n\n"
+        f"CRITICAL: No jumps. No style changes. Seamless continuation with voice-over narration."
     )

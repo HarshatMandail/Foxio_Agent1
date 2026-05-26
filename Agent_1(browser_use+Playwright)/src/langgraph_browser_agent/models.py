@@ -10,15 +10,6 @@ class UIElement(BaseModel):
     suggested_action: str
 
 
-class VideoClip(BaseModel):
-    """A recorded video clip for a single atomic browser step."""
-    step: int
-    video_path: str
-    narration: str = ""
-    action: str = ""
-    duration_hint: str = "3-8s"
-
-
 class PageCapture(BaseModel):
     """Single page capture during platform crawl."""
     url: str
@@ -50,5 +41,9 @@ class Agent1Output(BaseModel):
     )
     video_clips: List[dict] = Field(
         default_factory=list,
-        description="List of recorded video clips per step. Each entry: {step, video_path, narration, action}",
+        description="List of recorded video clips per step.",
+    )
+    trim_start_seconds: float = Field(
+        default=0,
+        description="Seconds to trim from the start of the recording (login/redirect duration).",
     )

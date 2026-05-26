@@ -1,4 +1,4 @@
-# browser_pool.py — Browser Pooling, Retry Logic & Graceful Cleanup
+# browser_pool.py — Browser Pooling with Video Recording
 import asyncio
 import logging
 from typing import Optional
@@ -8,9 +8,11 @@ from playwright.async_api import async_playwright, BrowserContext, Page, Playwri
 from .config import (
     BROWSER_DATA_DIR,
     BROWSER_CHANNEL,
+    BROWSER_USER_AGENT,
     HEADLESS,
     MAX_RETRIES,
     RETRY_BASE_DELAY,
+    SLOW_MO,
     VIDEO_CLIPS_DIR,
 )
 
@@ -19,9 +21,8 @@ logger = logging.getLogger(__name__)
 
 class BrowserPool:
     """
-    Manages a reusable browser context to avoid cold-start on every run.
-    Provides retry logic and graceful cleanup.
-    Video recording is enabled by default for all pages.
+    Manages a single persistent browser context with video recording.
+    Recording is always enabled — login portion is filtered out by video merger.
     """
 
     def __init__(self):
@@ -36,59 +37,66 @@ class BrowserPool:
                 await self._launch()
 
             try:
-                # Verify context is still alive
                 pages = self._context.pages
                 page = pages[0] if pages else await self._context.new_page()
-                # Quick health check
                 _ = page.url
                 return self._context, page
             except Exception:
                 logger.warning("Browser context stale, relaunching...")
                 await self._cleanup()
                 await self._launch()
-                page = self._context.pages[0] if self._context.pages else await self._context.new_page()
+                page = (
+                    self._context.pages[0]
+                    if self._context.pages
+                    else await self._context.new_page()
+                )
                 return self._context, page
 
     async def _launch(self) -> None:
-        """Launch a new persistent browser context with video recording enabled."""
+        """Launch a persistent browser context with video recording."""
         self._playwright = await async_playwright().start()
 
         launch_kwargs = {
             "user_data_dir": str(BROWSER_DATA_DIR),
             "headless": HEADLESS,
-            "viewport": {"width": 1280, "height": 900},
+            "viewport": {"width": 1280, "height": 720},
+            "user_agent": BROWSER_USER_AGENT,
             "record_video_dir": str(VIDEO_CLIPS_DIR),
-            "record_video_size": {"width": 1280, "height": 900},
+            "record_video_size": {"width": 1280, "height": 720},
+            "slow_mo": SLOW_MO,
             "args": [
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
                 "--no-default-browser-check",
+                "--disable-extensions",
+                "--disable-infobars",
+                "--disable-popup-blocking",
+                "--hide-scrollbars",
+                "--window-size=1280,720",
             ],
             "ignore_default_args": ["--enable-automation"],
         }
 
         if BROWSER_CHANNEL:
             launch_kwargs["channel"] = BROWSER_CHANNEL
-            logger.info(f"Using browser channel: {BROWSER_CHANNEL}")
 
         self._context = await self._playwright.chromium.launch_persistent_context(
             **launch_kwargs
         )
 
-        # Stealth injection
-        page = self._context.pages[0] if self._context.pages else await self._context.new_page()
-        await page.add_init_script(
+        await self._context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
         )
-        logger.info("Browser context launched with video recording enabled")
+
+        logger.info(f"Browser launched | slow_mo={SLOW_MO}ms | headless={HEADLESS}")
 
     async def release(self) -> None:
-        """Close browser context and playwright (call on shutdown)."""
+        """Close browser context and playwright."""
         async with self._lock:
             await self._cleanup()
 
     async def _cleanup(self) -> None:
-        """Internal cleanup — no lock."""
+        """Internal cleanup."""
         if self._context:
             try:
                 await self._context.close()
@@ -125,6 +133,7 @@ async def shutdown_browser_pool() -> None:
 
 
 # ─── Retry Decorator ──────────────────────────────────────────────────────────
+
 
 async def retry_async(coro_fn, *args, retries: int = MAX_RETRIES, **kwargs):
     """Execute an async function with exponential backoff retry."""

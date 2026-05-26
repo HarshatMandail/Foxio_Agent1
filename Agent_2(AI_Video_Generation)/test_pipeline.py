@@ -1,5 +1,5 @@
 """
-Test script — Validates the Edit-Video pipeline end-to-end.
+Test script — Validates the video generation pipeline end-to-end.
 
 Run with: python test_pipeline.py
 
@@ -8,53 +8,42 @@ Set DRY_RUN=false in .env to test with real xAI API.
 """
 
 import asyncio
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 from loguru import logger
 
-# Configure logging
 logger.remove()
-logger.add(sys.stdout, level="INFO", format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | <level>{message}</level>")
+logger.add(
+    sys.stdout,
+    level="INFO",
+    format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | <level>{message}</level>",
+)
 
 
-def create_fake_video_clips() -> list[dict]:
-    """Create fake .webm files to simulate Playwright recordings."""
-    tmp_dir = Path(tempfile.mkdtemp(prefix="test_clips_"))
+def _create_sample_video(duration: int = 20) -> str:
+    """Create a sample video for testing."""
+    tmp_dir = Path(tempfile.mkdtemp(prefix="test_raw_"))
+    output = tmp_dir / "test_raw_recording.mp4"
 
-    clips = []
-    for i in range(1, 4):
-        # Create a minimal valid video file using FFmpeg
-        fake_path = tmp_dir / f"step_{i:02d}_test.webm"
-
-        import subprocess
+    try:
         cmd = [
             "ffmpeg", "-y",
-            "-f", "lavfi", "-i", f"color=c=blue:s=1280x720:d=3",
-            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-            "-t", "3",
-            "-c:v", "libvpx", "-c:a", "libvorbis",
-            str(fake_path),
+            "-f", "lavfi", "-i", f"color=c=0x1a1a2e:s=1280x720:d={duration}",
+            "-t", str(duration),
+            "-c:v", "libx264", "-preset", "ultrafast",
+            "-pix_fmt", "yuv420p",
+            str(output),
         ]
+        subprocess.run(cmd, capture_output=True, timeout=30, check=True)
+        logger.info(f"Sample {duration}s video created: {output}")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        output.write_bytes(b"\x00" * 1024)
+        logger.warning("FFmpeg unavailable — created dummy file for dry-run")
 
-        try:
-            subprocess.run(cmd, capture_output=True, timeout=30, check=True)
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            # If FFmpeg fails, create a dummy file (dry-run won't need real video)
-            fake_path.write_bytes(b"\x1a\x45\xdf\xa3" * 100)  # Minimal webm header bytes
-            logger.warning(f"FFmpeg unavailable, created dummy file: {fake_path.name}")
-
-        clips.append({
-            "step": i,
-            "video_path": str(fake_path),
-            "narration": f"Click the button to perform action {i}",
-            "action": f"click_button: Action {i}",
-            "_platform_name": "Salesforce",
-        })
-
-    logger.info(f"Created {len(clips)} test video clips in: {tmp_dir}")
-    return clips
+    return str(output)
 
 
 async def test_pipeline_dry_run():
@@ -62,7 +51,6 @@ async def test_pipeline_dry_run():
     from config.settings import settings
     from graph.workflow import run_pipeline
 
-    # Force dry run for testing
     original_dry_run = settings.dry_run
     settings.dry_run = True
 
@@ -70,20 +58,15 @@ async def test_pipeline_dry_run():
     logger.info("PIPELINE TEST — Dry Run Mode")
     logger.info("=" * 60)
 
-    # Create test video clips
-    video_clips = create_fake_video_clips()
+    raw_video = _create_sample_video(duration=20)
 
-    logger.info(f"Video clips: {len(video_clips)}")
-    for clip in video_clips:
-        logger.info(f"  Step {clip['step']}: {clip['video_path']}")
-
-    # Run the pipeline
     result = await run_pipeline(
-        video_clips=video_clips,
-        job_id="test_001",
+        raw_video_path=raw_video,
+        user_prompt="Smooth cursor, professional SaaS tutorial.",
+        platform_name="Salesforce",
+        job_id="test_dry_001",
     )
 
-    # Print results
     logger.info("=" * 60)
     logger.info("RESULTS")
     logger.info("=" * 60)
@@ -98,59 +81,29 @@ async def test_pipeline_dry_run():
         failed = sum(1 for c in clip_results if c.get("status") == "failed")
         logger.info(f"Clips: {success} dry_run, {failed} failed")
 
-        for cr in clip_results:
-            logger.info(f"  Step {cr.get('step_index')}: {cr.get('status')} | {cr.get('mode')}")
-
-    # Restore
     settings.dry_run = original_dry_run
 
-    # Validate
     assert result["status"] == "completed", f"Expected 'completed', got '{result['status']}'"
     assert result.get("error") == "", f"Unexpected error: {result.get('error')}"
-    logger.success("✓ Pipeline test PASSED")
+    logger.success("✓ Pipeline dry-run test PASSED")
 
 
-async def test_preprocessing_only():
-    """Test just the preprocessing step (requires FFmpeg)."""
+async def test_preprocessing():
+    """Test the preprocessing step (requires FFmpeg)."""
     from nodes.utils import preprocess_video_for_grok
 
     logger.info("=" * 60)
     logger.info("PREPROCESSING TEST")
     logger.info("=" * 60)
 
-    clips = create_fake_video_clips()
-    first_clip = clips[0]["video_path"]
+    raw_video = _create_sample_video(duration=5)
 
     try:
-        processed = preprocess_video_for_grok(first_clip)
+        processed = preprocess_video_for_grok(raw_video)
         logger.success(f"✓ Preprocessing passed: {processed}")
         logger.info(f"  Output size: {Path(processed).stat().st_size // 1024}KB")
     except RuntimeError as e:
         logger.error(f"✗ Preprocessing failed: {e}")
-        logger.info("  (This is expected if FFmpeg is not installed)")
-
-
-async def test_step_splitter():
-    """Test the step splitter converts video_clips correctly."""
-    from nodes.step_splitter import split_video_clips_to_steps
-
-    logger.info("=" * 60)
-    logger.info("STEP SPLITTER TEST")
-    logger.info("=" * 60)
-
-    video_clips = [
-        {"step": 1, "video_path": "/tmp/fake1.webm", "narration": "Click the Contacts tab", "action": "click_nav: Contacts"},
-        {"step": 2, "video_path": "/tmp/fake2.webm", "narration": "Fill in the name field", "action": "type: First Name"},
-        {"step": 3, "video_path": "", "narration": "Missing path", "action": "click"},  # Should be skipped
-    ]
-
-    steps = split_video_clips_to_steps(video_clips, platform_name="Salesforce")
-
-    assert len(steps) == 2, f"Expected 2 steps (1 skipped), got {len(steps)}"
-    assert steps[0]["duration"] == 3  # "click" → SIMPLE_ACTION_DURATION
-    assert steps[1]["duration"] == 5  # "fill" → COMPLEX_ACTION_DURATION
-
-    logger.success(f"✓ Step splitter test PASSED ({len(steps)} steps generated)")
 
 
 async def main():
@@ -159,9 +112,7 @@ async def main():
     logger.info("RUNNING ALL PIPELINE TESTS")
     logger.info("=" * 60 + "\n")
 
-    await test_step_splitter()
-    print()
-    await test_preprocessing_only()
+    await test_preprocessing()
     print()
     await test_pipeline_dry_run()
 

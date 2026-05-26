@@ -6,38 +6,33 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
-from core.registry import VideoModel
-
 
 class VideoGenerationService(ABC):
-    """Abstract interface for video generation."""
+    """Abstract interface for video generation adapters."""
 
     @abstractmethod
-    async def generate(
+    async def generate_animated_clip(
         self,
-        model: VideoModel,
+        input_video_path: str,
         prompt: str,
-        duration: int,
-        output_path: Path,
+        duration: int = 8,
+        output_path: Path | None = None,
         aspect_ratio: str = "16:9",
         resolution: str = "480p",
-        start_image: str | None = None,
-        dry_run: bool = False,
     ) -> dict[str, Any]:
-        """
-        Generate a video clip and save it to output_path.
+        """Animate/enhance a clip (first clip, no prior context)."""
+        ...
 
-        Args:
-            model: The VideoModel definition from the registry.
-            prompt: Text prompt describing the video content.
-            duration: Clip duration in seconds (1-10).
-            output_path: Where to save the generated clip.
-            aspect_ratio: Video aspect ratio ("16:9", "9:16", "1:1").
-            resolution: Video resolution ("480p" or "720p").
-            start_image: Optional URL for image-to-video.
-            dry_run: If True, skip API call and log only.
-
-        Returns:
-            Dict with generation metadata.
-        """
+    @abstractmethod
+    async def extend_video(
+        self,
+        previous_video_path: str | None,
+        input_video_path: str,
+        prompt: str,
+        duration: int = 8,
+        output_path: Path | None = None,
+        aspect_ratio: str = "16:9",
+        resolution: str = "480p",
+    ) -> dict[str, Any]:
+        """Extend from previous clip for seamless continuity."""
         ...

@@ -1,11 +1,9 @@
-# nodes.py — LangGraph Node Functions (Navigate + Analyze)
+# nodes.py — LangGraph Node Functions (Navigate + Analyze + Verify)
 import asyncio
 import json
 import logging
 import os
-import shutil
 import time
-import uuid
 
 from playwright.async_api import Page
 
@@ -15,14 +13,13 @@ from .config import (
     AGENT_OUTPUT_DIR,
     NAVIGATION_TIMEOUT_MS,
     PAGE_LOAD_TIMEOUT_MS,
-    VIDEO_CLIPS_DIR,
     WAIT_FOR_LOGIN_TIMEOUT,
     LOGIN_CHECK_INTERVAL,
 )
 from .cost_tracker import get_session, reset_session, estimate_tokens
 from .llm import analyze_with_llm
 from .logger import AuditLogger
-from .models import Agent1Output, PageCapture, PageContext, UIElement, VideoClip
+from .models import Agent1Output, PageCapture, PageContext, UIElement
 from .navigation_planner import plan_navigation
 from .prompts import SYSTEM_PROMPT
 from .security import assert_url_safe, SecurityError
@@ -34,6 +31,7 @@ MAX_WORKFLOW_PAGES = int(os.getenv("MAX_WORKFLOW_PAGES", "6"))
 
 
 # ─── URL Detection Helpers ────────────────────────────────────────────────────
+
 
 def _is_login_page(url: str) -> bool:
     indicators = ["/login", "/signin", "/sign-in", "/sso", "/oauth", "/authorize"]
@@ -65,6 +63,7 @@ def _is_app_url(url: str) -> bool:
 
 
 # ─── Login Detection ─────────────────────────────────────────────────────────
+
 
 async def _wait_for_login(page: Page, audit: AuditLogger) -> bool:
     """Wait for user to complete login (including 2FA)."""
@@ -98,7 +97,8 @@ async def _wait_for_login(page: Page, audit: AuditLogger) -> bool:
             if stable_app_url_count >= 2:
                 logger.info(f"Login complete: {current_url[:80]}")
                 audit.log("login_complete", {"url": current_url})
-                await asyncio.sleep(3)
+                # Wait for app to fully render
+                await _wait_for_network_idle(page)
                 return True
             continue
 
@@ -113,6 +113,35 @@ async def _wait_for_login(page: Page, audit: AuditLogger) -> bool:
     return False
 
 
+# ─── Fast Wait Helpers ────────────────────────────────────────────────────────
+
+
+async def _wait_for_network_idle(page: Page, timeout_ms: int = 10000) -> None:
+    """Wait for network idle state — no pending requests."""
+    try:
+        await page.wait_for_load_state("networkidle", timeout=timeout_ms)
+    except Exception:
+        await asyncio.sleep(2)
+
+
+async def _wait_for_page_ready(page: Page) -> None:
+    """Wait for page to be interactive — domcontentloaded + brief settle."""
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=PAGE_LOAD_TIMEOUT_MS)
+    except Exception:
+        pass
+    await asyncio.sleep(0.5)
+    await _wait_for_network_idle(page, timeout_ms=5000)
+
+
+async def _scroll_element_into_view(page: Page, locator) -> None:
+    """Scroll element into viewport before clicking — fast, no delay."""
+    try:
+        await locator.scroll_into_view_if_needed(timeout=2000)
+    except Exception:
+        pass
+
+
 # ─── DOM Filtering (Token Optimization) ───────────────────────────────────────
 
 _NOISE_BUTTONS = {
@@ -123,9 +152,7 @@ _NOISE_BUTTONS = {
 
 
 def _filter_dom_for_llm(dom_summary: dict, is_primary_page: bool = False) -> dict:
-    """Strip noise from DOM data before sending to LLM.
-    Primary page gets more detail; secondary pages get minimal context.
-    """
+    """Strip noise from DOM data before sending to LLM."""
     text_limit = 800 if is_primary_page else 300
 
     filtered = {
@@ -134,7 +161,6 @@ def _filter_dom_for_llm(dom_summary: dict, is_primary_page: bool = False) -> dic
         "visible_text": dom_summary.get("visible_text", "")[:text_limit],
     }
 
-    # Navigation — more for primary page
     nav = dom_summary.get("navigation", [])
     seen_texts: set[str] = set()
     filtered_nav = []
@@ -146,7 +172,6 @@ def _filter_dom_for_llm(dom_summary: dict, is_primary_page: bool = False) -> dic
     nav_limit = 20 if is_primary_page else 8
     filtered["navigation"] = filtered_nav[:nav_limit]
 
-    # Buttons — more detail for primary page
     buttons = dom_summary.get("buttons", [])
     btn_limit = 25 if is_primary_page else 10
     filtered["buttons"] = [
@@ -154,7 +179,6 @@ def _filter_dom_for_llm(dom_summary: dict, is_primary_page: bool = False) -> dic
         if b.get("text", "").strip().lower() not in _NOISE_BUTTONS
     ]
 
-    # Inputs — only for primary page (helps understand forms)
     if is_primary_page:
         filtered["inputs"] = dom_summary.get("inputs", [])[:15]
 
@@ -165,62 +189,14 @@ def _filter_dom_for_llm(dom_summary: dict, is_primary_page: bool = False) -> dic
     return filtered
 
 
-# ─── Video Recording Helpers ──────────────────────────────────────────────────
+# ─── Main Node: Navigate & Capture ───────────────────────────────────────────
 
-async def _finalize_step_video(page: Page, step_num: int, narration: str, action: str) -> dict | None:
-    """Close the page to finalize its video recording and return the clip metadata.
-    Playwright writes the video file when the page is closed.
-    """
-    try:
-        video = page.video
-        if video is None:
-            return None
-
-        # Get the path where Playwright saved the video
-        video_path = await video.path()
-
-        # Rename to a meaningful filename
-        step_id = uuid.uuid4().hex[:8]
-        final_name = f"step_{step_num:02d}_{step_id}.webm"
-        final_path = VIDEO_CLIPS_DIR / final_name
-
-        # Close page to finalize the video file
-        await page.close()
-
-        # Wait briefly for file to be fully written
-        await asyncio.sleep(1)
-
-        # Move the video to our organized directory with a clear name
-        if video_path and os.path.exists(str(video_path)):
-            shutil.move(str(video_path), str(final_path))
-        else:
-            # Video might already be in VIDEO_CLIPS_DIR with auto-generated name
-            final_path = video_path
-
-        clip = VideoClip(
-            step=step_num,
-            video_path=str(final_path),
-            narration=narration,
-            action=action,
-        )
-        logger.info(f"  Video clip saved: {final_path}")
-        return clip.model_dump()
-
-    except Exception as e:
-        logger.warning(f"  Failed to finalize video for step {step_num}: {e}")
-        try:
-            await page.close()
-        except Exception:
-            pass
-        return None
-
-
-# ─── Main Node: Navigate & Capture (Hybrid Mode) ─────────────────────────────
 
 async def navigate_and_crawl(state: AgentState) -> dict:
-    """Hybrid navigation: captures current page, then uses LLM to plan and
-    execute workflow navigation steps for multi-page capture.
-    Records a video clip for each atomic step.
+    """
+    Hybrid navigation: captures current page, then uses LLM to plan and
+    execute workflow navigation steps. Uses SINGLE page for all steps
+    to produce one continuous video recording.
     """
     url = state["url"]
     session_id = str(int(time.time()))
@@ -235,21 +211,22 @@ async def navigate_and_crawl(state: AgentState) -> dict:
         logger.error(f"Security check failed: {e}")
         audit.log("security_blocked", {"url": url, "error": str(e)})
         audit.save()
-        return {"page_captures": [], "video_clips": []}
+        return {"page_captures": []}
 
     reset_session()
     pool = get_browser_pool()
-
-    video_clips: list[dict] = []
+    _t0 = time.time()
 
     try:
         context, page = await pool.acquire()
 
+        # Navigate to target URL
         async def _navigate():
             await page.goto(url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
 
         try:
             await retry_async(_navigate, retries=2)
+            await _wait_for_page_ready(page)
             logger.info(f"Page loaded: {page.url}")
             audit.log("page_loaded", {"url": page.url})
         except Exception as e:
@@ -265,10 +242,14 @@ async def navigate_and_crawl(state: AgentState) -> dict:
             logger.info("Login page detected. Please complete login + 2FA in the browser.")
             await _wait_for_login(page, audit)
 
-        # ─── HYBRID CAPTURE ───────────────────────────────────────────────
+        # Seconds to trim from video (login + redirects)
+        _trim = time.time() - _t0
+        logger.info(f"Pre-task duration: {_trim:.1f}s (will be trimmed from video)")
+
+        # ─── HYBRID CAPTURE (single page, no new tabs) ───────────────────
         captures = []
 
-        # Step 1: Capture the current page (always)
+        # Step 1: Capture the current page
         primary_capture = await capture_page(page, 1)
         if primary_capture:
             captures.append(primary_capture)
@@ -277,39 +258,38 @@ async def navigate_and_crawl(state: AgentState) -> dict:
                 "title": primary_capture.title,
             })
 
-        # Step 2: LLM-driven workflow navigation (captures additional pages + video clips)
+        # Step 2: LLM-driven workflow navigation on the SAME page
         if primary_capture:
-            workflow_captures, step_clips = await _execute_workflow_navigation(
-                context, page, primary_capture, state["user_query"], audit,
+            workflow_captures = await _execute_workflow_navigation(
+                page, primary_capture, state["user_query"], audit,
             )
             captures.extend(workflow_captures)
-            video_clips.extend(step_clips)
 
     except Exception as e:
         logger.error(f"Browser operation failed: {e}")
         audit.log("browser_error", {"error": str(e)})
         captures = []
 
-    audit.log("capture_complete", {"pages_captured": len(captures), "video_clips": len(video_clips)})
+    audit.log("capture_complete", {"pages_captured": len(captures)})
     audit.save()
 
-    return {"page_captures": captures, "video_clips": video_clips}
+    return {"page_captures": captures, "trim_start_seconds": _trim}
 
 
-# ─── Hybrid Navigation Executor ──────────────────────────────────────────────
+# ─── Workflow Navigation (Single Page) ────────────────────────────────────────
+
 
 async def _execute_workflow_navigation(
-    context,
     page: Page,
     primary: PageCapture,
     user_query: str,
     audit: AuditLogger,
-) -> tuple[list[PageCapture], list[dict]]:
-    """Use LLM navigation planner to walk through the workflow and capture each page.
-    Records a video clip for each atomic navigation step.
+) -> list[PageCapture]:
+    """
+    Navigate through workflow steps on the SAME page.
+    No new tabs = Playwright records everything in one continuous video file.
     """
     extra_captures = []
-    video_clips = []
 
     try:
         plan = await plan_navigation(
@@ -320,55 +300,40 @@ async def _execute_workflow_navigation(
         )
     except Exception as e:
         logger.warning(f"Navigation planner failed: {e}")
-        return extra_captures, video_clips
+        return extra_captures
 
     if not plan.get("needs_navigation"):
         logger.info("Navigation Planner: No additional navigation needed.")
-        return extra_captures, video_clips
+        return extra_captures
 
     steps = plan.get("steps", [])
     max_steps = min(len(steps), MAX_WORKFLOW_PAGES - 1)
-    logger.info(f"Navigation Planner: Executing {max_steps} navigation steps with video recording...")
+    logger.info(f"Navigation Planner: Executing {max_steps} steps on single page...")
 
     for i, step in enumerate(steps[:max_steps]):
         action = step.get("action", "")
         target = step.get("target", "")
         description = step.get("description", "")
-        wait_after = step.get("wait_after", 2)
 
         logger.info(f"  Step {i+1}/{max_steps}: {description} [{action}: {target[:60]}]")
         audit.log("workflow_step", {"step": i+1, "action": action, "target": target[:80]})
 
         try:
-            # Create a new page for this step to get a dedicated video recording
-            step_page = await context.new_page()
-
-            # Navigate the new page to the current URL so it starts from the right state
-            current_url = page.url
-            await step_page.goto(current_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT_MS)
-            await asyncio.sleep(1)
-
-            # Execute the action on the step page
-            navigated = await _execute_single_step(step_page, action, target)
+            navigated = await _execute_single_step(page, action, target)
             if not navigated:
                 logger.warning(f"  Step {i+1}: Could not execute, skipping.")
                 audit.log("workflow_step_skipped", {"step": i+1, "reason": "element_not_found"})
-                try:
-                    await step_page.close()
-                except Exception:
-                    pass
                 continue
 
-            # Wait for content to render
-            base_wait = max(wait_after, 3)
-            await asyncio.sleep(base_wait)
+            # Wait for content to settle
+            await _wait_for_page_ready(page)
 
-            # For button clicks (likely opening modals), verify content changed
+            # For button clicks, verify modal/content appeared
             if action == "click_button":
-                await _wait_for_new_content(step_page)
+                await _wait_for_new_content(page)
 
-            # Capture the page state after the action
-            cap = await capture_page(step_page, len(extra_captures) + 2)
+            # Capture the page state
+            cap = await capture_page(page, len(extra_captures) + 2)
             if cap:
                 extra_captures.append(cap)
                 audit.log("workflow_page_captured", {
@@ -377,63 +342,135 @@ async def _execute_workflow_navigation(
                     "title": cap.title,
                 })
                 logger.info(f"  Step {i+1}: Captured -> {cap.title}")
-            else:
-                logger.warning(f"  Step {i+1}: Page capture returned None (error page?)")
-
-            # Finalize the video clip for this step
-            clip = await _finalize_step_video(
-                step_page,
-                step_num=i + 1,
-                narration=description,
-                action=f"{action}: {target}",
-            )
-            if clip:
-                video_clips.append(clip)
-
-            # Update the main page reference to the step page's final URL
-            # so the next step starts from the correct state
-            try:
-                final_url = step_page.url
-            except Exception:
-                final_url = current_url
-
-            # Navigate the main page to where the step ended up
-            try:
-                await page.goto(final_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT_MS)
-                await asyncio.sleep(1)
-            except Exception:
-                pass
 
         except Exception as e:
             logger.warning(f"  Step {i+1}: Failed - {e}")
             audit.log("workflow_step_error", {"step": i+1, "error": str(e)})
             continue
 
-    logger.info(
-        f"Hybrid navigation complete: {len(extra_captures)} pages captured, "
-        f"{len(video_clips)} video clips recorded."
-    )
-    return extra_captures, video_clips
+    logger.info(f"Navigation complete: {len(extra_captures)} additional pages captured.")
+    return extra_captures
 
 
 async def _execute_single_step(page: Page, action: str, target: str) -> bool:
-    """Execute a single navigation step. Returns True if successful."""
+    """Execute a single navigation step on the current page."""
     if action == "goto_url":
         await page.goto(target, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT_MS)
         return True
 
     if action == "click_nav":
-        return await _click_element_by_text(page, target, element_type="link")
+        return await _click_element(page, target, element_type="link")
 
     if action == "click_button":
-        return await _click_element_by_text(page, target, element_type="button")
+        return await _click_element(page, target, element_type="button")
 
     logger.warning(f"Unknown action type: {action}")
     return False
 
 
+async def _click_element(page: Page, text: str, element_type: str = "link") -> bool:
+    """Click an element using role-based and text-based selectors (fast, reliable)."""
+    text_clean = text.strip()
+    url_before = page.url
+
+    # Strategy 1: Role-based selectors (most reliable)
+    try:
+        if element_type == "link":
+            locator = page.get_by_role("link", name=text_clean, exact=False)
+        else:
+            locator = page.get_by_role("button", name=text_clean, exact=False)
+
+        if await locator.first.is_visible(timeout=3000):
+            await _scroll_element_into_view(page, locator.first)
+            await locator.first.click(timeout=5000)
+            await _wait_for_navigation_or_modal(page, url_before)
+            return True
+    except Exception:
+        pass
+
+    # Strategy 2: Text-based CSS selectors
+    selectors = []
+    if element_type == "link":
+        selectors = [
+            f'a:has-text("{text_clean}")',
+            f'[role="link"]:has-text("{text_clean}")',
+            f'one-app-nav-bar-item-root:has-text("{text_clean}")',
+        ]
+    else:
+        selectors = [
+            f'button:has-text("{text_clean}")',
+            f'[role="button"]:has-text("{text_clean}")',
+            f'input[value="{text_clean}"]',
+        ]
+
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if await locator.is_visible(timeout=2000):
+                await _scroll_element_into_view(page, locator)
+                await locator.click(timeout=5000)
+                await _wait_for_navigation_or_modal(page, url_before)
+                return True
+        except Exception:
+            continue
+
+    # Strategy 3: JS fallback for dynamic elements
+    escaped_text = text_clean.replace('"', '\\"')
+    clicked = await page.evaluate("""(targetText) => {
+        const target = targetText.toLowerCase();
+        const elements = document.querySelectorAll(
+            'a, button, [role="button"], [role="link"], [role="tab"], one-app-nav-bar-item-root'
+        );
+        for (const el of elements) {
+            const elText = (el.textContent || el.getAttribute('title') || '').trim().toLowerCase();
+            if (elText === target || elText.includes(target)) {
+                el.click();
+                return true;
+            }
+        }
+        return false;
+    }""", escaped_text)
+
+    if clicked:
+        await _wait_for_navigation_or_modal(page, url_before)
+        return True
+
+    return False
+
+
+async def _wait_for_navigation_or_modal(page: Page, url_before: str) -> None:
+    """After a click, wait for URL change or modal appearance."""
+    await asyncio.sleep(1)
+
+    # URL changed = real navigation
+    if page.url != url_before:
+        await _wait_for_page_ready(page)
+        return
+
+    # Check for modal/dialog
+    modal_selectors = [
+        '[role="dialog"]',
+        '.slds-modal',
+        '.forceModalContainer',
+        '.uiModal',
+        'section[role="dialog"]',
+    ]
+
+    for _ in range(10):  # Up to 5 seconds
+        for selector in modal_selectors:
+            try:
+                if await page.locator(selector).first.is_visible(timeout=200):
+                    await asyncio.sleep(1.5)
+                    return
+            except Exception:
+                continue
+        await asyncio.sleep(0.5)
+
+    await asyncio.sleep(1)
+
+
 async def _wait_for_new_content(page: Page) -> None:
-    """Wait until a modal/form/new content is visible after a button click."""
+    """Wait for modal/form content to render after a button click."""
     content_selectors = [
         '[role="dialog"]',
         '.slds-modal__content',
@@ -442,145 +479,100 @@ async def _wait_for_new_content(page: Page) -> None:
         '.forceModalContainer',
         '.uiModal',
         'records-lwc-record-layout',
-        'records-record-layout-event-broker',
-        '.forceDetailPanel',
     ]
 
-    for attempt in range(20):  # Up to 10 seconds
+    for _ in range(12):  # Up to 6 seconds
         for selector in content_selectors:
             try:
-                locator = page.locator(selector).first
-                if await locator.is_visible(timeout=200):
-                    # Modal found — now wait for form inputs to render inside
-                    await asyncio.sleep(2)
+                if await page.locator(selector).first.is_visible(timeout=200):
+                    # Wait for form inputs inside modal
                     try:
-                        input_locator = page.locator('[role="dialog"] input, .slds-modal input, .uiModal input').first
-                        await input_locator.wait_for(state="visible", timeout=5000)
+                        await page.locator(
+                            '[role="dialog"] input, .slds-modal input'
+                        ).first.wait_for(state="visible", timeout=4000)
                     except Exception:
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(1)
                     return
             except Exception:
                 continue
         await asyncio.sleep(0.5)
 
-    # Fallback wait if nothing detected
-    await asyncio.sleep(3)
+    await asyncio.sleep(1)
 
 
-async def _click_element_by_text(page: Page, text: str, element_type: str = "link") -> bool:
-    """Find and click an element by its visible text. Tries multiple strategies."""
-    text_clean = text.strip()
-    url_before = page.url
-
-    selectors = []
-    if element_type == "link":
-        selectors = [
-            f'a:has-text("{text_clean}")',
-            f'[role="link"]:has-text("{text_clean}")',
-            f'nav a:has-text("{text_clean}")',
-            f'one-app-nav-bar-item-root:has-text("{text_clean}")',
-        ]
-    elif element_type == "button":
-        selectors = [
-            f'button:has-text("{text_clean}")',
-            f'[role="button"]:has-text("{text_clean}")',
-            f'input[value="{text_clean}"]',
-            f'a:has-text("{text_clean}")',
-        ]
-
-    clicked = False
-    for selector in selectors:
-        try:
-            locator = page.locator(selector).first
-            if await locator.is_visible(timeout=3000):
-                await locator.click(timeout=5000)
-                clicked = True
-                break
-        except Exception:
-            continue
-
-    # Fallback: case-insensitive JS click
-    if not clicked:
-        escaped_text = text_clean.replace('"', '\\"')
-        clicked = await page.evaluate("""(targetText) => {
-            const target = targetText.toLowerCase();
-            const elements = document.querySelectorAll('a, button, [role="button"], [role="link"], [role="tab"], one-app-nav-bar-item-root');
-            for (const el of elements) {
-                const elText = (el.textContent || el.getAttribute('title') || '').trim().toLowerCase();
-                if (elText === target || elText.includes(target)) {
-                    el.click();
-                    return true;
-                }
-            }
-            return false;
-        }""", escaped_text)
-
-    if not clicked:
-        return False
-
-    # Wait for result — either page navigation OR modal/dialog appearing
-    await _wait_for_page_change_or_modal(page, url_before)
-    return True
+# ─── Task Completion Verification Node ────────────────────────────────────────
 
 
-async def _wait_for_page_change_or_modal(page: Page, url_before: str) -> None:
-    """After a click, wait for either a URL change (navigation) or a modal/dialog to appear.
-    Salesforce Lightning often opens forms as modals without URL change.
+async def verify_task_completion(state: AgentState) -> dict:
     """
-    # Give a brief moment for any navigation to start
-    await asyncio.sleep(1.5)
+    Verify the final task was completed by checking if the expected UI element
+    is visible (e.g., a form, modal, or target page). If not, attempt one retry.
+    """
+    captures = state.get("page_captures") or []
+    user_query = state["user_query"]
 
-    # Check if URL changed (real navigation happened)
-    if page.url != url_before:
-        try:
-            await page.wait_for_load_state("domcontentloaded", timeout=PAGE_LOAD_TIMEOUT_MS)
-        except Exception:
-            await asyncio.sleep(2)
-        # Extra wait for Salesforce Lightning to finish rendering
-        await asyncio.sleep(2)
-        return
+    if not captures:
+        logger.warning("[Verify] No captures — cannot verify task completion.")
+        return {"task_completed": False}
 
-    # URL didn't change — likely a modal/dialog opened. Wait for it to render.
-    modal_selectors = [
-        '[role="dialog"]',
-        '.modal-container',
-        '.slds-modal',
-        '.slds-modal__container',
-        'section[role="dialog"]',
-        '.forceModalContainer',
-        '.uiModal',
-        '.panel-content',
-        'records-record-layout-event-broker',
-        '.slds-modal__content',
-        'records-lwc-record-layout',
-        '.forceDetailPanel',
-    ]
+    # Check if the last captured page shows the expected end state
+    last_capture = captures[-1]
+    dom = last_capture.dom_summary
 
-    for attempt in range(20):  # Wait up to 10 seconds (20 * 0.5s)
-        for selector in modal_selectors:
-            try:
-                locator = page.locator(selector).first
-                if await locator.is_visible(timeout=200):
-                    # Modal found — wait for form fields to render inside it
-                    await asyncio.sleep(3)
-                    logger.info(f"  Modal/dialog detected: {selector}")
-                    return
-            except Exception:
-                continue
-        await asyncio.sleep(0.5)
+    # Heuristic: task is "complete" if we reached a form, modal, or relevant page
+    query_lower = user_query.lower()
+    has_form = dom.get("forms", 0) > 0 or dom.get("modals", 0) > 0
+    has_relevant_content = any(
+        keyword in (dom.get("title", "") + dom.get("h1", "") + dom.get("visible_text", "")).lower()
+        for keyword in _extract_keywords(query_lower)
+    )
 
-    # Neither navigation nor modal detected — wait and proceed
-    await asyncio.sleep(3)
-    logger.info("  No navigation or modal detected, proceeding with current state.")
+    if has_form or has_relevant_content:
+        logger.info("[Verify] Task completion confirmed — target content visible.")
+        return {"task_completed": True}
+
+    # Attempt one retry: navigate back and try the final step again
+    logger.info("[Verify] Target content not confirmed. Attempting final step retry...")
+
+    try:
+        pool = get_browser_pool()
+        context, page = await pool.acquire()
+
+        # Try clicking the most likely final action button
+        final_action_keywords = ["new", "create", "add", "open", "start"]
+        for keyword in final_action_keywords:
+            if keyword in query_lower:
+                try:
+                    btn = page.get_by_role("button", name=keyword, exact=False)
+                    if await btn.first.is_visible(timeout=3000):
+                        await btn.first.click(timeout=5000)
+                        await _wait_for_new_content(page)
+                        logger.info(f"[Verify] Retry click on '{keyword}' succeeded.")
+                        return {"task_completed": True}
+                except Exception:
+                    continue
+
+    except Exception as e:
+        logger.warning(f"[Verify] Retry failed: {e}")
+
+    logger.info("[Verify] Could not confirm task completion.")
+    return {"task_completed": False}
+
+
+def _extract_keywords(query: str) -> list[str]:
+    """Extract meaningful keywords from user query for verification."""
+    stop_words = {"how", "do", "i", "a", "the", "in", "to", "for", "my", "is", "at", "on"}
+    words = query.split()
+    return [w for w in words if w not in stop_words and len(w) > 2][:5]
 
 
 # ─── Main Node: Analyze & Generate Output ─────────────────────────────────────
+
 
 async def analyze_and_generate_output(state: AgentState) -> dict:
     """Analyze captured pages with LLM and produce task-specific guidance."""
     captures = state["page_captures"] or []
     user_query = state["user_query"]
-    video_clips = state.get("video_clips") or []
 
     if not captures:
         logger.warning("No pages captured — returning empty output")
@@ -599,13 +591,16 @@ async def analyze_and_generate_output(state: AgentState) -> dict:
             )
         }
 
-    # Build the LLM input — primary page gets full detail, others get workflow context
     primary = captures[0]
     pages_data = []
 
     for i, cap in enumerate(captures):
         is_primary = (i == 0)
-        page_role = "CURRENT_PAGE (user is looking at this right now)" if is_primary else f"WORKFLOW_STEP_{i} (navigated to during workflow)"
+        page_role = (
+            "CURRENT_PAGE (user is looking at this right now)"
+            if is_primary
+            else f"WORKFLOW_STEP_{i} (navigated to during workflow)"
+        )
         pages_data.append({
             "page_role": page_role,
             "url": cap.url,
@@ -616,11 +611,9 @@ async def analyze_and_generate_output(state: AgentState) -> dict:
         })
 
     pages_json = json.dumps(pages_data, separators=(",", ":"), default=str)
-
     est_tokens = estimate_tokens(pages_json)
     logger.info(f"Input to LLM: ~{est_tokens} tokens for {len(captures)} pages")
 
-    # Construct user message with multi-page context
     multi_page_note = ""
     if len(captures) > 1:
         multi_page_note = (
@@ -648,7 +641,6 @@ async def analyze_and_generate_output(state: AgentState) -> dict:
         f"Respond with JSON matching the schema in your system instructions."
     )
 
-    # Use full model when we have multi-page data for richer output
     use_mini = len(captures) == 1 and est_tokens < 2000
 
     try:
@@ -661,7 +653,6 @@ async def analyze_and_generate_output(state: AgentState) -> dict:
         logger.error(f"LLM call failed: {e}")
         data = _fallback_output(captures, str(e))
 
-    # Build structured output
     current_page = PageContext(
         url=data["current_page"]["url"],
         title=data["current_page"]["title"],
@@ -679,10 +670,10 @@ async def analyze_and_generate_output(state: AgentState) -> dict:
         overall_user_journey=data["overall_user_journey"],
         relevant_workflows=workflows,
         context_for_video=data.get("context_for_video", ""),
-        video_clips=video_clips,
+        video_clips=[],
+        trim_start_seconds=state.get("trim_start_seconds", 0),
     )
 
-    # Log cost summary
     session = get_session()
     summary = session.get_summary()
     logger.info(
@@ -690,7 +681,6 @@ async def analyze_and_generate_output(state: AgentState) -> dict:
         f"Calls: {summary['call_count']} | Cache hits: {summary['cache_hits']}"
     )
 
-    # Persist Agent 1 output to disk
     _save_agent_output(output)
 
     return {"structured_output": output}
@@ -698,13 +688,13 @@ async def analyze_and_generate_output(state: AgentState) -> dict:
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
+
 def _save_agent_output(output: Agent1Output) -> None:
     """Persist Agent 1 structured output to disk as JSON."""
     timestamp = int(time.time())
     output_file = AGENT_OUTPUT_DIR / f"agent1_output_{timestamp}.json"
 
     data = output.model_dump()
-    # Remove raw page captures (large/redundant with audit logs)
     for page in data.get("pages_captured", []):
         page.pop("dom_summary", None)
         page.pop("screenshot_path", None)

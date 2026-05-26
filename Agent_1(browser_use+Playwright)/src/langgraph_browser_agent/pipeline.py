@@ -1,13 +1,16 @@
 # pipeline.py — Unified Foxio Pipeline: Agent 1 (Browser + Merge) → Agent 2 (Split + Animate + Extend)
 
+import asyncio
 import logging
 import sys
 from pathlib import Path
 from typing import Any
 
 from .agent import run_agent1
+from .browser_pool import shutdown_browser_pool
+from .config import OUTPUT_DIR
 from .models import Agent1Output
-from .video_merger import merge_all_recordings
+from .video_merger import merge_all_recordings, clean_old_clips
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +33,7 @@ async def run_full_pipeline(
 ) -> dict[str, Any]:
     """
     Execute the complete Foxio pipeline:
-      Agent 1: Navigate → record videos (multiple tabs/pages) → merge into ONE raw .mp4
+      Agent 1: Navigate → record video (single page) → merge into ONE raw .mp4
       Agent 2: Split into ≤8s clips → animate first → extend rest → concat final video
 
     Args:
@@ -50,11 +53,16 @@ async def run_full_pipeline(
     # ─── Agent 1: Browser Navigation + Video Recording ────────────────────────
     logger.info("[Pipeline] Running Agent 1: Platform analysis + video recording...")
 
+    # Clean stale clips from previous runs before recording
+    clean_old_clips()
+
     try:
+        # Never let agent1 close the browser — pipeline controls lifecycle
+        # so video files are finalized at the right time.
         agent1_output: Agent1Output = await run_agent1(
             url=url,
             user_query=user_query,
-            cleanup_browser=cleanup_browser,
+            cleanup_browser=False,
         )
     except Exception as e:
         logger.error(f"[Pipeline] Agent 1 failed: {e}")
@@ -63,15 +71,24 @@ async def run_full_pipeline(
     logger.info(
         f"[Pipeline] Agent 1 complete | "
         f"Platform: {agent1_output.platform_name} | "
-        f"Pages: {len(agent1_output.pages_captured)} | "
-        f"Video clips: {len(agent1_output.video_clips)}"
+        f"Pages: {len(agent1_output.pages_captured)}"
     )
 
+    # ─── Close browser to finalize video recordings ───────────────────────────
+    # Playwright only writes complete .webm files when the context is closed.
+    logger.info("[Pipeline] Closing browser to finalize video recordings...")
+    await shutdown_browser_pool()
+    await asyncio.sleep(2)
+
     # ─── Merge all recordings into ONE raw .mp4 ──────────────────────────────
-    logger.info("[Pipeline] Merging all recorded videos into single raw .mp4...")
+    logger.info("[Pipeline] Merging recorded videos (filtering junk clips)...")
 
     try:
-        raw_video_path = merge_all_recordings(output_filename="raw_recording.mp4")
+        raw_video_path = merge_all_recordings(
+            output_filename="raw_long_video.mp4",
+            output_dir=OUTPUT_DIR,
+            trim_start=agent1_output.trim_start_seconds,
+        )
     except RuntimeError as e:
         logger.error(f"[Pipeline] Video merge failed: {e}")
         return {
@@ -82,11 +99,11 @@ async def run_full_pipeline(
         }
 
     if not raw_video_path:
-        logger.warning("[Pipeline] No recordings to merge. Cannot generate video.")
+        logger.warning("[Pipeline] No valid recordings to merge.")
         return {
             "status": "partial",
             "stage": "no_recordings",
-            "error": "No video recordings found after browser task.",
+            "error": "No valid video recordings found after browser task.",
             "agent1_output": agent1_output.model_dump(),
         }
 
