@@ -1,13 +1,13 @@
 """
 LangGraph StateGraph workflow for the video generation pipeline.
 
-Pipeline: enqueue → split → process (animate + extend-video) → concatenate → finalize
+Pipeline: enqueue → split → process → concatenate → finalize
 
 Strategy:
   1. Take the single merged raw .mp4 from Agent 1
   2. Split into ≤8.0s clips (Grok API limit)
-  3. Process sequentially: clip 0 = animate, clips 1+ = extend-video
-  4. Concatenate all enhanced clips into final smooth video
+  3. Process each clip independently via edit-video mode
+  4. Concatenate all enhanced clips with cross-fade into final video
   5. Cleanup temp files
 """
 
@@ -106,7 +106,7 @@ def node_process(state: PipelineState) -> dict[str, Any]:
     user_prompt = state.get("user_prompt", "")
     platform_name = state.get("platform_name", "Salesforce")
 
-    logger.info(f"[Job {job_id}] Processing {len(clips)} clips (animate + extend-video)...")
+    logger.info(f"[Job {job_id}] Processing {len(clips)} clips (edit-video)...")
 
     async def _run() -> list[dict[str, Any]]:
         return await process_clips_sequentially(

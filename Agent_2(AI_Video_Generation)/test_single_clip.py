@@ -6,8 +6,9 @@ from pathlib import Path
 
 sys.stdout.reconfigure(line_buffering=True)
 
-from adapters.grok_adapter import GrokAdapter
+from adapters import get_adapter
 from config.settings import settings
+from nodes.video_processor import ENHANCEMENT_PROMPT
 
 
 async def main():
@@ -29,21 +30,16 @@ async def main():
     print(f"API Key: {settings.xai_api_key[:10]}...")
     print(f"Dry Run: {settings.dry_run}")
 
-    adapter = GrokAdapter(api_key=settings.xai_api_key)
+    adapter = get_adapter()
     output_path = clips_dir / "test_enhanced.mp4"
-
-    prompt = (
-        "EXACT VISUAL EDIT of this Salesforce screen recording. "
-        "Keep all UI identical. Add smooth cursor and friendly voice-over."
-    )
 
     print("Calling Grok Imagine Video API...")
     print("(This takes 60-120 seconds, please wait...)")
 
     try:
-        result = await adapter.generate_animated_clip(
+        result = await adapter.generate_video(
             input_video_path=str(clip_path),
-            prompt=prompt,
+            prompt=ENHANCEMENT_PROMPT,
             duration=8,
             output_path=output_path,
         )

@@ -6,6 +6,7 @@ from nodes.utils import (
     cleanup_preprocessed,
     ensure_directories,
     preprocess_video_for_grok,
+    probe_duration,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "cleanup_preprocessed",
     "ensure_directories",
     "preprocess_video_for_grok",
+    "probe_duration",
 ]

@@ -1,34 +1,39 @@
 """
-Video Splitter — Splits a single raw recording into ≤8.0s clips for Grok API.
+Video Splitter — Splits a raw recording into overlapping clips for Grok API.
 
-Grok Imagine Video has a hard ~8.7s limit per API call. We split at exactly
-8.0s boundaries to stay safely under the limit with no overlap.
+Grok Imagine Video has a ~8.7s limit per call. We create 8s clips
+with 1s overlap for smooth cross-fade transitions during concatenation.
 """
 
-import json
 import subprocess
 from pathlib import Path
 
 from loguru import logger
 
 from config.settings import settings
+from nodes.utils import probe_duration
 
-MAX_CLIP_SECONDS = 8.0
+CLIP_DURATION = 8.0
+OVERLAP_SECONDS = 1.0
+STEP_SECONDS = CLIP_DURATION - OVERLAP_SECONDS
 
 
 def split_video_into_clips(
     raw_video_path: str,
     output_dir: Path | None = None,
-    max_seconds: float = MAX_CLIP_SECONDS,
+    max_seconds: float = CLIP_DURATION,
 ) -> list[dict]:
     """
-    Split a raw .mp4 video into sequential clips of max_seconds each.
+    Split a raw .mp4 video into overlapping clips for Grok API.
 
-    Uses FFmpeg segment muxer for exact timing with no overlap or gap.
+    Each clip is 8s long. Consecutive clips overlap by 1s:
+      clip_0: 0.0 - 8.0s
+      clip_1: 7.0 - 15.0s
+      clip_2: 14.0 - 22.0s
 
     Args:
         raw_video_path: Path to the merged raw .mp4 from Agent 1.
-        output_dir: Directory to write clip files. Defaults to settings.clip_output_dir.
+        output_dir: Directory to write clip files.
         max_seconds: Maximum duration per clip (default 8.0s).
 
     Returns:
@@ -44,77 +49,73 @@ def split_video_into_clips(
     out_dir = output_dir or settings.clip_output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Probe total duration
-    total_duration = _probe_duration(input_path)
+    total_duration = probe_duration(input_path)
     if not total_duration or total_duration <= 0:
         raise RuntimeError(f"[Splitter] Cannot determine video duration: {raw_video_path}")
 
-    num_clips = int(total_duration // max_seconds) + (1 if total_duration % max_seconds > 0.1 else 0)
+    clip_starts = _calculate_clip_starts(total_duration)
 
     logger.info(
         f"[Splitter] Splitting {input_path.name} ({total_duration:.1f}s) "
-        f"into {num_clips} clips of ≤{max_seconds}s each"
+        f"into {len(clip_starts)} clips of ≤{max_seconds}s with {OVERLAP_SECONDS}s overlap"
     )
 
-    # Use FFmpeg segment to split at exact boundaries
-    output_pattern = str(out_dir / "split_%03d.mp4")
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(input_path),
-        "-c", "copy",
-        "-f", "segment",
-        "-segment_time", str(max_seconds),
-        "-reset_timestamps", "1",
-        output_pattern,
-    ]
-
-    try:
-        subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=True)
-    except subprocess.CalledProcessError as e:
-        logger.error(f"[Splitter] FFmpeg segment failed: {e.stderr[:300]}")
-        raise RuntimeError(f"Video splitting failed: {e.stderr[:200]}") from e
-    except FileNotFoundError:
-        raise RuntimeError("[Splitter] FFmpeg not found. Install FFmpeg.")
-
-    # Collect generated clips and probe their durations
     clips = []
-    for clip_file in sorted(out_dir.glob("split_*.mp4")):
-        clip_duration = _probe_duration(clip_file) or max_seconds
-        clip_index = len(clips)
+    for i, start in enumerate(clip_starts):
+        remaining = total_duration - start
+        duration = min(max_seconds, remaining)
+
+        if duration < 1.0:
+            break
+
+        output_file = out_dir / f"split_{i:03d}.mp4"
+        _extract_clip(input_path, output_file, start, duration, i)
+
+        actual_duration = probe_duration(output_file) or duration
 
         clips.append({
-            "index": clip_index,
-            "path": str(clip_file),
-            "start_time": clip_index * max_seconds,
-            "duration": min(clip_duration, max_seconds),
+            "index": i,
+            "path": str(output_file),
+            "start_time": start,
+            "duration": actual_duration,
         })
 
     logger.info(f"[Splitter] Created {len(clips)} clips from {total_duration:.1f}s source")
-
-    for clip in clips:
-        logger.info(
-            f"  Clip {clip['index']:02d}: {Path(clip['path']).name} "
-            f"({clip['duration']:.1f}s, starts at {clip['start_time']:.1f}s)"
-        )
-
     return clips
 
 
-def _probe_duration(video_path: Path) -> float | None:
-    """Probe video duration using FFprobe."""
+def _calculate_clip_starts(total_duration: float) -> list[float]:
+    """Calculate clip start times with overlap."""
+    starts = []
+    t = 0.0
+    while t < total_duration:
+        starts.append(t)
+        t += STEP_SECONDS
+        if t >= total_duration and (total_duration - starts[-1]) < 1.0:
+            break
+    return starts
+
+
+def _extract_clip(input_path: Path, output_file: Path, start: float, duration: float, index: int) -> None:
+    """Extract a single clip using FFmpeg."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{start:.3f}",
+        "-i", str(input_path),
+        "-t", f"{duration:.3f}",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "20",
+        "-r", "30",
+        "-pix_fmt", "yuv420p",
+        "-an",
+        "-movflags", "+faststart",
+        str(output_file),
+    ]
+
     try:
-        cmd = [
-            "ffprobe",
-            "-v", "quiet",
-            "-print_format", "json",
-            "-show_format",
-            str(video_path),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=True)
-        data = json.loads(result.stdout)
-        duration = float(data.get("format", {}).get("duration", 0))
-        return duration if duration > 0 else None
-    except Exception as e:
-        logger.warning(f"[Splitter] FFprobe failed for {video_path.name}: {e}")
-        return None
+        subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Splitting failed at clip {index}: {e.stderr[:200]}") from e
+    except FileNotFoundError:
+        raise RuntimeError("[Splitter] FFmpeg not found. Install FFmpeg.")

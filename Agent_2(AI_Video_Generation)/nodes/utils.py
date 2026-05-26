@@ -43,13 +43,10 @@ def cleanup_preprocessed() -> None:
 
 def concatenate_clips(clip_paths: list[str], job_id: str) -> Path:
     """
-    Concatenate multiple video clips into a single final video using FFmpeg.
+    Concatenate multiple video clips with 1-second cross-fade transitions.
 
-    Uses concat demuxer with re-encoding for format consistency.
-    Applies consistent encoding settings for a professional output:
-      - H.264 with CRF 18 (high quality)
-      - yuv420p for maximum compatibility
-      - faststart for web streaming
+    Uses FFmpeg filter_complex with xfade between consecutive clips.
+    The 1s cross-fade blends the overlapping regions for seamless transitions.
     """
     if not clip_paths:
         raise ValueError("No clips to concatenate")
@@ -57,46 +54,126 @@ def concatenate_clips(clip_paths: list[str], job_id: str) -> Path:
     settings.final_output_dir.mkdir(parents=True, exist_ok=True)
     output_path = settings.final_output_dir / f"tutorial_{job_id}.mp4"
 
-    concat_list_path = settings.clip_output_dir / "concat_list.txt"
-    with open(concat_list_path, "w") as f:
-        for clip_path in sorted(clip_paths):
-            absolute_path = Path(clip_path).resolve()
-            f.write(f"file '{absolute_path}'\n")
+    sorted_paths = sorted(clip_paths)
+    n = len(sorted_paths)
 
-    logger.info(f"Concatenating {len(clip_paths)} clips into: {output_path}")
+    print(f"\n🔄 Concatenating {n} clips...")
+    logger.info(f"[Concat] Starting concatenation of {n} clips into: {output_path}")
 
-    # High-quality encoding for professional tutorial output
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", str(concat_list_path),
+    # Single clip — no cross-fade needed
+    if n == 1:
+        logger.info("[Concat] Single clip — copying directly")
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", sorted_paths[0],
+            "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+            "-r", "30", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            str(output_path),
+        ]
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=True)
+            final_dur = probe_duration(output_path) or 0
+            print(f"✅ Final video: {output_path.name} ({final_dur:.1f}s)")
+            logger.success(f"[Concat] Final video created: {output_path} ({final_dur:.1f}s)")
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"FFmpeg failed: {e.stderr[:200]}") from e
+        return output_path
+
+    # Probe durations of each clip
+    xfade_duration = 1.0
+    clip_durations = []
+    for i, p in enumerate(sorted_paths):
+        dur = probe_duration(Path(p)) or 8.0
+        clip_durations.append(dur)
+        logger.info(f"[Concat] Clip {i}: {Path(p).name} — {dur:.2f}s")
+
+    total_input = sum(clip_durations)
+    expected_output = total_input - (xfade_duration * (n - 1))
+    print(f"   Input total: {total_input:.1f}s | Cross-fades: {n-1} x {xfade_duration}s | Expected output: {expected_output:.1f}s")
+    logger.info(f"[Concat] Total input: {total_input:.1f}s | Expected output: {expected_output:.1f}s")
+
+    # Build FFmpeg command with inputs
+    cmd = ["ffmpeg", "-y"]
+    for p in sorted_paths:
+        cmd.extend(["-i", str(Path(p).resolve())])
+
+    # Build xfade filter chain with correct cumulative offsets
+    # Offset for xfade[i] = (sum of durations 0..i) - (i * xfade_duration) - xfade_duration
+    # Simplified: offset[i] = sum(durations[0:i+1]) - (i+1) * xfade_duration
+    filter_parts = []
+
+    for i in range(n - 1):
+        # Calculate offset: point in the OUTPUT timeline where this xfade starts
+        offset = sum(clip_durations[:i + 1]) - (i + 1) * xfade_duration
+        offset = max(0, offset)  # safety
+
+        if i == 0:
+            in1 = "[0:v]"
+            in2 = "[1:v]"
+        else:
+            in1 = f"[v{i}]"
+            in2 = f"[{i + 1}:v]"
+
+        out_label = "[outv]" if i == n - 2 else f"[v{i + 1}]"
+
+        filter_parts.append(
+            f"{in1}{in2}xfade=transition=fade:duration={xfade_duration}:offset={offset:.3f}{out_label}"
+        )
+        logger.info(f"[Concat] xfade {i}: offset={offset:.3f}s {in1}+{in2} -> {out_label}")
+
+    filter_complex = ";".join(filter_parts)
+
+    cmd.extend([
+        "-filter_complex", filter_complex,
+        "-map", "[outv]",
         "-c:v", "libx264",
         "-preset", "medium",
         "-crf", "18",
-        "-r", "60",              # Force 60fps output for smooth playback
-        "-movflags", "+faststart",
+        "-r", "30",
         "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        str(output_path),
+    ])
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=True)
+        final_dur = probe_duration(output_path) or 0
+        print(f"✅ Final video: {output_path.name} ({final_dur:.1f}s)")
+        logger.success(f"[Concat] Final video with cross-fade: {output_path} ({final_dur:.1f}s)")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"[Concat] FFmpeg xfade failed: {e.stderr[:500]}")
+        print(f"⚠️  Cross-fade failed, falling back to simple concat...")
+        logger.warning("[Concat] Falling back to simple concat without cross-fade...")
+        return _fallback_concat(sorted_paths, output_path)
+    except FileNotFoundError:
+        raise RuntimeError("FFmpeg not found. Install FFmpeg and ensure it's in PATH.")
+
+    return output_path
+
+
+def _fallback_concat(clip_paths: list[str], output_path: Path) -> Path:
+    """Simple concat fallback if xfade fails."""
+    concat_list_path = settings.clip_output_dir / "concat_list.txt"
+    with open(concat_list_path, "w") as f:
+        for clip_path in clip_paths:
+            f.write(f"file '{Path(clip_path).resolve()}'\n")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", str(concat_list_path),
+        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-r", "30", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         str(output_path),
     ]
 
     try:
-        subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=300,
-            check=True,
-        )
-        logger.success(f"Final video created: {output_path}")
+        subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=True)
+        logger.success(f"Fallback concat created: {output_path}")
     except subprocess.CalledProcessError as e:
-        logger.error(f"FFmpeg failed: {e.stderr}")
-        raise RuntimeError(f"FFmpeg concatenation failed: {e.stderr}") from e
-    except FileNotFoundError:
-        raise RuntimeError(
-            "FFmpeg not found. Install FFmpeg and ensure it's in PATH."
-        )
+        raise RuntimeError(f"Fallback concat failed: {e.stderr[:200]}") from e
+    finally:
+        concat_list_path.unlink(missing_ok=True)
 
     return output_path
 
@@ -136,7 +213,7 @@ def preprocess_video_for_grok(video_path: str) -> str:
     height = settings.preprocess_height
 
     # Probe input duration to decide trim strategy
-    input_duration = _probe_duration(input_path)
+    input_duration = probe_duration(input_path)
 
     # Build FFmpeg command
     cmd = ["ffmpeg", "-y"]
@@ -199,7 +276,7 @@ def preprocess_video_for_grok(video_path: str) -> str:
     return str(output_path)
 
 
-def _probe_duration(video_path: Path) -> float | None:
+def probe_duration(video_path: Path) -> float | None:
     """
     Probe video duration using FFprobe.
 
