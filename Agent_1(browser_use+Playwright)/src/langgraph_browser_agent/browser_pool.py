@@ -26,10 +26,11 @@ class BrowserPool:
     Recording is always enabled — login portion is filtered out by video merger.
     """
 
-    def __init__(self):
+    def __init__(self, use_persistent_login: bool = True):
         self._playwright: Optional[Playwright] = None
         self._context: Optional[BrowserContext] = None
         self._lock = asyncio.Lock()
+        self._use_persistent_login = use_persistent_login
 
     async def acquire(self) -> tuple[BrowserContext, Page]:
         """Get or create a browser context and page."""
@@ -41,6 +42,7 @@ class BrowserPool:
                 pages = self._context.pages
                 page = pages[0] if pages else await self._context.new_page()
                 _ = page.url
+                print(f"🔄 [browser_pool] Acquired page | URL: {page.url[:100]}")
                 return self._context, page
             except Exception:
                 logger.warning("Browser context stale, relaunching...")
@@ -53,11 +55,12 @@ class BrowserPool:
                 )
                 return self._context, page
 
-    async def _launch(self, use_persistent_login: bool = True) -> None:
+    async def _launch(self) -> None:
         """Launch a browser context with video recording and optional persistent login."""
         self._playwright = await async_playwright().start()
 
         video_dir = str(VIDEO_CLIPS_DIR)
+        use_persistent_login = self._use_persistent_login
 
         browser_args = [
             "--disable-blink-features=AutomationControlled",
@@ -95,7 +98,7 @@ class BrowserPool:
                 extra_http_headers={"Accept-Language": "en-US"},
             )
         else:
-            print("🔄 [browser_pool] Starting fresh browser session (no saved login)")
+            print("🔄 [browser_pool] Starting fresh session - will save login after success")
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 720},
                 record_video_dir=video_dir,
@@ -112,7 +115,25 @@ class BrowserPool:
 
         logger.info(f"Browser launched | slow_mo={SLOW_MO}ms | headless={HEADLESS}")
 
-    async def release(self) -> None:
+        # === NEW: Save login state ONLY after we are on Seller Home ===
+        if use_persistent_login:
+            await asyncio.sleep(3)  # give page time to settle
+            try:
+                # Check if we are really on the home page
+                if "lightning/page/home" in self._context.pages[0].url or await self._context.pages[0].get_by_text("Seller Home").is_visible(timeout=5000):
+                    await save_login_state(self._context)
+                else:
+                    print("🔄 [browser_pool] Not yet on Seller Home — skipping save for now")
+            except Exception as e:
+                print(f"⚠️ [browser_pool] Could not check home page: {e}")
+
+    async def release(self, context=None):
+        """Only close context after the full task is done. Do not close early."""
+        print("🔄 [browser_pool] Releasing browser context after task completion...")
+        # Do NOT close the page or context here - let the main graph handle final cleanup
+        pass
+
+    async def shutdown(self) -> None:
         """Close browser context and playwright."""
         async with self._lock:
             await self._cleanup()
@@ -150,7 +171,7 @@ async def shutdown_browser_pool() -> None:
     """Gracefully shutdown the browser pool."""
     global _pool
     if _pool:
-        await _pool.release()
+        await _pool.shutdown()
         _pool = None
 
 
