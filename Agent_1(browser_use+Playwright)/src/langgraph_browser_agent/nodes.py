@@ -8,7 +8,7 @@ import time
 from playwright.async_api import Page
 
 from .browser_helpers import capture_page
-from .browser_pool import get_browser_pool, retry_async
+from .browser_pool import get_browser_pool, save_login_state
 from .config import (
     AGENT_OUTPUT_DIR,
     NAVIGATION_TIMEOUT_MS,
@@ -97,8 +97,12 @@ async def _wait_for_login(page: Page, audit: AuditLogger) -> bool:
             if stable_app_url_count >= 2:
                 logger.info(f"Login complete: {current_url[:80]}")
                 audit.log("login_complete", {"url": current_url})
-                # Wait for app to fully render
                 await _wait_for_network_idle(page)
+                try:
+                    await save_login_state(page.context)
+                    print("✅✅✅ [nodes.py] PERSISTENT LOGIN STATE SAVED SUCCESSFULLY! ✅✅✅")
+                except Exception as e:
+                    print(f"❌ [nodes.py] save_login_state failed: {e}")
                 return True
             continue
 
@@ -125,13 +129,8 @@ async def _wait_for_network_idle(page: Page, timeout_ms: int = 10000) -> None:
 
 
 async def _wait_for_page_ready(page: Page) -> None:
-    """Wait for page to be interactive — domcontentloaded + brief settle."""
-    try:
-        await page.wait_for_load_state("domcontentloaded", timeout=PAGE_LOAD_TIMEOUT_MS)
-    except Exception:
-        pass
-    await asyncio.sleep(0.5)
-    await _wait_for_network_idle(page, timeout_ms=5000)
+    """Wait for page to settle after navigation — no forced reloads."""
+    await asyncio.sleep(2)
 
 
 async def _scroll_element_into_view(page: Page, locator) -> None:
@@ -215,36 +214,42 @@ async def navigate_and_crawl(state: AgentState) -> dict:
 
     reset_session()
     pool = get_browser_pool()
-    _t0 = time.time()
 
     try:
         context, page = await pool.acquire()
 
         # Navigate to target URL
-        async def _navigate():
-            await page.goto(url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
-
         try:
-            await retry_async(_navigate, retries=2)
-            await _wait_for_page_ready(page)
+            await page.goto(url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
+            await asyncio.sleep(4)
             logger.info(f"Page loaded: {page.url}")
             audit.log("page_loaded", {"url": page.url})
         except Exception as e:
             logger.warning(f"Initial navigation issue: {e}")
             audit.log("navigation_error", {"error": str(e)})
 
-        # Handle login
+        # Handle login / auth redirects
         current_url = page.url
         if _is_app_url(current_url):
             logger.info("Already logged in, skipping login wait.")
             audit.log("already_logged_in")
+            # We landed on the app but the initial context may have recorded
+            # the redirect chain (login URL -> frontdoor -> home).
+            # Restart with a clean recording context on the final stable URL.
+            stable_url = page.url
+            context, page = await pool.restart_with_recording()
+            await page.goto(stable_url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
+            await asyncio.sleep(2)
         else:
             logger.info("Login page detected. Please complete login + 2FA in the browser.")
             await _wait_for_login(page, audit)
+            stable_url = page.url
+            context, page = await pool.restart_with_recording()
+            await page.goto(stable_url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
+            await asyncio.sleep(2)
 
-        # Seconds to trim from video (login + redirects)
-        _trim = time.time() - _t0
-        logger.info(f"Pre-task duration: {_trim:.1f}s (will be trimmed from video)")
+        # Recording starts from here — no login footage
+        logger.info("Recording context ready. Starting task capture.")
 
         # ─── HYBRID CAPTURE (single page, no new tabs) ───────────────────
         captures = []
@@ -270,12 +275,10 @@ async def navigate_and_crawl(state: AgentState) -> dict:
         audit.log("browser_error", {"error": str(e)})
         captures = []
 
-    await capture_page(page, state)  # final capture
-
     audit.log("capture_complete", {"pages_captured": len(captures)})
     audit.save()
 
-    return {"page_captures": captures, "trim_start_seconds": _trim}
+    return {"page_captures": captures, "trim_start_seconds": 0}
 
 
 # ─── Workflow Navigation (Single Page) ────────────────────────────────────────
@@ -359,18 +362,13 @@ async def _execute_single_step(page: Page, action: str, target: str, state=None)
     """Execute a single navigation step on the current page."""
     if action == "goto_url":
         await page.goto(target, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT_MS)
-        await capture_page(page, state)
         return True
 
     if action == "click_nav":
-        result = await _click_element(page, target, element_type="link")
-        await capture_page(page, state)
-        return result
+        return await _click_element(page, target, element_type="link")
 
     if action == "click_button":
-        result = await _click_element(page, target, element_type="button")
-        await capture_page(page, state)
-        return result
+        return await _click_element(page, target, element_type="button")
 
     logger.warning(f"Unknown action type: {action}")
     return False

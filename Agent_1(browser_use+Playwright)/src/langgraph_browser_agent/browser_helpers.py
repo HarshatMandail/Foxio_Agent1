@@ -13,38 +13,14 @@ logger = logging.getLogger(__name__)
 
 
 async def should_start_recording(page) -> bool:
-    """Return True only when we are on the actual Salesforce Home page (skip login page)."""
+    """Return True when we are past the login page (any authenticated app page)."""
     url = page.url.lower()
-    if "/login" in url or "login.salesforce.com" in url:
+    if not url or url in ("about:blank", "chrome://newtab/"):
         return False
-    try:
-        await page.wait_for_selector("text='Seller Home' OR text='Home'", timeout=3000)
-        return True
-    except:
+    login_indicators = ["/login", "/signin", "/sign-in", "/sso", "/oauth", "/authorize", "login.salesforce.com"]
+    if any(ind in url for ind in login_indicators):
         return False
-
-
-async def dismiss_common_popups(page):
-    """Auto-dismiss common Salesforce popups and modals."""
-    selectors = [
-        "text=Dismiss", "text=Got it", "text=Close", "text=×",
-        "button:has-text('Dismiss')", "button:has-text('Got it')",
-        "[data-testid*='dismiss']", ".slds-modal__close", 
-        "text=Stay ahead of incidents"
-    ]
-    for selector in selectors:
-        try:
-            await page.click(selector, timeout=1500)
-            await page.wait_for_timeout(300)
-        except:
-            pass
-
-
-def _safe_filename(text: str, max_len: int = 40) -> str:
-    return "".join(
-        c if c.isalnum() or c in ("_", "-") else "_"
-        for c in text[:max_len]
-    ).strip("_") or "page"
+    return True
 
 
 async def _has_active_form_modal(page: Page) -> bool:
@@ -61,98 +37,38 @@ async def _has_active_form_modal(page: Page) -> bool:
     }""")
 
 
-async def dismiss_popups(page: Page, preserve_form_modals: bool = True) -> None:
-    """Dismiss common popups/walkthroughs/promotional dialogs.
-    If preserve_form_modals=True, will NOT dismiss modals that contain form fields.
-    """
-    # If there's an active form modal, don't dismiss anything
-    if preserve_form_modals:
+async def dismiss_common_popups(page):
+    """Auto-dismiss common Salesforce promotional popups (NOT form modals)."""
+    try:
+        if await _has_active_form_modal(page):
+            return
+    except Exception:
+        pass
+
+    selectors = [
+        "button:has-text('Dismiss')",
+        "button:has-text('Got it')",
+        "button:has-text('Skip')",
+        "button:has-text('Not Now')",
+        "button.slds-popover__close",
+        "button.toastClose",
+        "[data-testid*='dismiss']",
+    ]
+    for selector in selectors:
         try:
-            if await _has_active_form_modal(page):
-                logger.info("Active form modal detected — skipping popup dismissal")
-                return
+            loc = page.locator(selector).first
+            if await loc.is_visible(timeout=800):
+                await loc.click(timeout=2000)
+                await asyncio.sleep(0.3)
         except Exception:
             pass
 
-    # Phase 1: JS-based dismissal — only target promotional/walkthrough popups
-    await page.evaluate("""() => {
-        // Only dismiss popups that are NOT record/form modals
-        const isFormModal = (el) => {
-            return el.querySelector('input, select, textarea, form, records-lwc-record-layout');
-        };
 
-        const dismissTexts = [
-            'skip', 'dismiss', 'got it', 'no thanks',
-            'not now', 'maybe later', 'remind me later',
-        ];
-        const allButtons = document.querySelectorAll('button, a[role="button"], [role="button"]');
-        allButtons.forEach(btn => {
-            const text = (btn.textContent || '').trim().toLowerCase();
-            if (dismissTexts.includes(text)) {
-                // Make sure this button is NOT inside a form modal
-                const parentModal = btn.closest('[role="dialog"], .slds-modal, .uiModal');
-                if (!parentModal || !isFormModal(parentModal)) {
-                    btn.click();
-                }
-            }
-        });
-
-        const closeSelectors = [
-            'button.slds-popover__close',
-            '.walkthrough-close', '[data-dismiss]',
-            '.slds-notification__close', '.slds-prompt__close',
-            'button.toastClose',
-        ];
-        closeSelectors.forEach(sel => {
-            document.querySelectorAll(sel).forEach(el => el.click());
-        });
-    }""")
-    await asyncio.sleep(1)
-
-    # Phase 2: Targeted Playwright dismissal for promotional popups only
-    dismiss_selectors = [
-        'button:has-text("Dismiss")',
-        'button:has-text("Skip")',
-        'button:has-text("Not Now")',
-        'button:has-text("Got It")',
-        '[class*="popover"] button',
-        '[class*="walkthrough"] button',
-    ]
-    for selector in dismiss_selectors:
-        try:
-            btn = page.locator(selector).first
-            if await btn.is_visible(timeout=500):
-                # Verify it's not inside a form modal
-                is_in_form = await btn.evaluate(
-                    """(el) => {
-                        const modal = el.closest('[role="dialog"], .slds-modal, .uiModal');
-                        if (!modal) return false;
-                        return !!modal.querySelector('input, select, textarea, form');
-                    }"""
-                )
-                if not is_in_form:
-                    await btn.click()
-                    await asyncio.sleep(0.5)
-        except Exception:
-            continue
-
-    await asyncio.sleep(1)
-
-
-async def has_error_page(page: Page) -> bool:
-    """Check if the current page shows an access/error message."""
-    text = await page.evaluate(
-        """() => (document.body.innerText || '').substring(0, 1000).toLowerCase()"""
-    )
-    error_indicators = [
-        "something went wrong",
-        "you don't have access",
-        "insufficient privileges",
-        "no access to this record",
-        "ask your administrator",
-        "page not found",
-    ]
-    return any(indicator in text for indicator in error_indicators)
+def _safe_filename(text: str, max_len: int = 40) -> str:
+    return "".join(
+        c if c.isalnum() or c in ("_", "-") else "_"
+        for c in text[:max_len]
+    ).strip("_") or "page"
 
 
 _DOM_EXTRACTION_SCRIPT = """() => JSON.stringify({
@@ -202,23 +118,45 @@ _DOM_EXTRACTION_SCRIPT = """() => JSON.stringify({
 })"""
 
 
-async def capture_page(page, state):
-    if not await should_start_recording(page):
-        print("🔇 [capture_page] Skipping login / loading page from recording...")
-        return
+async def capture_page(page, state=None):
+    """Capture page state: screenshot + DOM extraction."""
+    try:
+        if not await should_start_recording(page):
+            return None
+    except Exception:
+        return None
 
-    # Smart wait - this fixes most slowness
-    await page.wait_for_load_state("networkidle", timeout=15000)
-    await page.wait_for_timeout(800)
+    try:
+        await asyncio.sleep(1)
+    except Exception:
+        pass
 
-    # Auto-dismiss popups
     await dismiss_common_popups(page)
 
-    # Simple deduplication to avoid duplicate frames
-    current_key = f"{page.url}_{len(await page.content())}"
-    if getattr(state, "last_ui_key", None) == current_key:
-        return
-    state.last_ui_key = current_key
+    # Extract DOM summary
+    try:
+        dom_raw = await page.evaluate(_DOM_EXTRACTION_SCRIPT)
+        dom_summary = json.loads(dom_raw) if isinstance(dom_raw, str) else dom_raw
+    except Exception as e:
+        logger.warning(f"DOM extraction failed: {e}")
+        dom_summary = {"title": "", "h1": "", "visible_text": "", "navigation": [], "buttons": [], "forms": 0, "inputs": [], "tables": 0, "modals": 0}
 
-    # Existing screenshot + DOM logic continues here...
-    # (keep all your original screenshot, context_for_video, etc. code)
+    # Take screenshot
+    screenshot_path = None
+    try:
+        title_slug = _safe_filename(dom_summary.get("title", "page"))
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        screenshot_path = str(SCREENSHOTS_DIR / f"{ts}_{title_slug}.png")
+        await page.screenshot(path=screenshot_path, full_page=False)
+    except Exception as e:
+        logger.warning(f"Screenshot failed: {e}")
+
+    buttons = dom_summary.get("buttons", [])
+    return PageCapture(
+        url=page.url,
+        title=dom_summary.get("title", ""),
+        dom_summary=dom_summary,
+        screenshot_path=screenshot_path,
+        buttons=buttons,
+        forms_count=dom_summary.get("forms", 0),
+    )

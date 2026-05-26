@@ -1,6 +1,6 @@
 # models.py
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Optional
 
 
 class UIElement(BaseModel):
@@ -14,7 +14,7 @@ class PageCapture(BaseModel):
     """Single page capture during platform crawl."""
     url: str
     title: str
-    screenshot_path: str
+    screenshot_path: Optional[str] = None
     dom_summary: dict
     navigation_links: List[str] = []
     buttons: List[dict] = []

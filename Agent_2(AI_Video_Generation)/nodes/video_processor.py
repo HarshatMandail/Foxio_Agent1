@@ -61,20 +61,18 @@ async def process_clips_sequentially(
         output_path = settings.clip_output_dir / f"enhanced_{clip_index:03d}.mp4"
 
         if i == 0:
-            # First clip — use animate mode
             logger.info(f"[Processor] Clip {clip_index}/{total-1} — ANIMATE mode")
             result = await _process_with_retry(
                 adapter=adapter,
                 mode="animate",
                 input_video_path=clip_path,
                 prompt=_build_animate_prompt(user_prompt, platform_name, clip_index, total),
-                duration=clip_duration,
+                duration=round(clip_duration),
                 output_path=output_path,
                 previous_clip_path=None,
                 clip_index=clip_index,
             )
         else:
-            # Subsequent clips — use extend-video mode from previous output
             logger.info(
                 f"[Processor] Clip {clip_index}/{total-1} — EXTEND-VIDEO mode "
                 f"(continuing from clip {clip_index - 1})"
@@ -84,7 +82,7 @@ async def process_clips_sequentially(
                 mode="extend",
                 input_video_path=clip_path,
                 prompt=_build_extend_prompt(user_prompt, platform_name, clip_index, total),
-                duration=clip_duration,
+                duration=round(clip_duration),
                 output_path=output_path,
                 previous_clip_path=previous_output_path,
                 clip_index=clip_index,
@@ -129,7 +127,7 @@ async def _process_with_retry(
                 result = await adapter.generate_animated_clip(
                     input_video_path=input_video_path,
                     prompt=prompt,
-                    duration=int(min(duration, settings.max_clip_duration)),
+                    duration=min(duration, settings.max_clip_duration),
                     output_path=output_path,
                 )
             else:
@@ -137,7 +135,7 @@ async def _process_with_retry(
                     previous_video_path=previous_clip_path,
                     input_video_path=input_video_path,
                     prompt=prompt,
-                    duration=int(min(duration, settings.max_clip_duration)),
+                    duration=min(duration, settings.max_clip_duration),
                     output_path=output_path,
                 )
 

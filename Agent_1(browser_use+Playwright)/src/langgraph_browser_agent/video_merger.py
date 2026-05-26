@@ -83,12 +83,12 @@ def merge_all_recordings(
     trim_start: float = 0,
 ) -> Optional[str]:
     """
-    Convert .webm -> .mp4, filter junk, merge, and trim login from start.
+    Convert .webm -> .mp4, filter junk, and merge into one output file.
 
     Args:
         output_filename: Name for the merged output file.
         output_dir: Directory for the output.
-        trim_start: Seconds to cut from the beginning (login/redirect duration).
+        trim_start: Deprecated, kept for API compatibility.
 
     Returns:
         Path to the final .mp4 file, or None if no valid recordings found.
@@ -101,10 +101,8 @@ def merge_all_recordings(
         logger.warning("[VideoMerger] Video clips directory does not exist.")
         return None
 
-    # Step 1: Convert all .webm to .mp4 in-place
     convert_clips_to_mp4()
 
-    # Step 2: Collect all .mp4 clips sorted by CREATION time (chronological order)
     all_recordings = sorted(
         video_dir.glob("*.mp4"),
         key=lambda f: os.path.getctime(f),
@@ -116,7 +114,6 @@ def merge_all_recordings(
 
     logger.info(f"[VideoMerger] Found {len(all_recordings)} .mp4 clips. Filtering...")
 
-    # Step 3: Filter clips — remove short and blank ones
     valid_clips = []
     discarded_clips = []
 
@@ -130,19 +127,10 @@ def merge_all_recordings(
             discard_reason = "mostly_blank"
 
         if discard_reason:
-            discarded_clips.append({
-                "file": clip_path.name,
-                "duration": duration,
-                "reason": discard_reason,
-            })
+            discarded_clips.append({"file": clip_path.name, "duration": duration, "reason": discard_reason})
             logger.info(f"  [SKIP] {clip_path.name} — {discard_reason}")
         else:
-            valid_clips.append({
-                "file": clip_path.name,
-                "path": str(clip_path),
-                "duration": duration,
-                "ctime": os.path.getctime(clip_path),
-            })
+            valid_clips.append({"file": clip_path.name, "path": str(clip_path), "duration": duration, "ctime": os.path.getctime(clip_path)})
             logger.info(f"  [KEEP] {clip_path.name} — {duration:.1f}s")
 
     if not valid_clips:
@@ -152,26 +140,18 @@ def merge_all_recordings(
 
     output_path = dest_dir / output_filename
 
-    # Step 4: Merge valid clips into one final .mp4
     if len(valid_clips) == 1:
-        logger.info("[VideoMerger] Single valid clip — copying to output...")
-        # Already .mp4, just re-mux to ensure consistent format
         _remux_mp4(Path(valid_clips[0]["path"]), output_path)
     else:
         logger.info(f"[VideoMerger] Merging {len(valid_clips)} valid .mp4 clips...")
         _concat_mp4_clips([Path(c["path"]) for c in valid_clips], output_path)
 
     if output_path.exists() and output_path.stat().st_size > 0:
-        # Trim login/blank portion from the beginning
-        if trim_start > 2:
-            _trim_video_start(output_path, trim_start)
-
         total_duration = _get_clip_duration(output_path) or 0
-        logger.info(
-            f"[VideoMerger] Done: {output_path} "
-            f"({output_path.stat().st_size // 1024}KB, ~{total_duration:.1f}s)"
-        )
+        logger.info(f"[VideoMerger] Done: {output_path} ({output_path.stat().st_size // 1024}KB, ~{total_duration:.1f}s)")
         _save_metadata(dest_dir, valid_clips, discarded_clips, str(output_path))
+        # Clean up intermediate clips from video_clips dir
+        _cleanup_intermediate_clips(video_dir)
         return str(output_path)
 
     logger.error("[VideoMerger] Merge failed — output file missing or empty.")
@@ -286,30 +266,6 @@ def _remux_mp4(input_path: Path, output_path: Path) -> None:
     _run_ffmpeg(cmd, "remux")
 
 
-def _trim_video_start(video_path: Path, seconds: float) -> None:
-    """Trim the first N seconds from a video file in-place (no re-encoding)."""
-    tmp_path = video_path.with_suffix(".trimmed.mp4")
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", str(seconds),
-        "-i", str(video_path),
-        "-c", "copy",
-        "-movflags", "+faststart",
-        str(tmp_path),
-    ]
-    try:
-        _run_ffmpeg(cmd, "trim")
-        if tmp_path.exists() and tmp_path.stat().st_size > 0:
-            video_path.unlink()
-            tmp_path.rename(video_path)
-            logger.info(f"[VideoMerger] Trimmed {seconds:.1f}s from start")
-        else:
-            tmp_path.unlink(missing_ok=True)
-    except Exception as e:
-        logger.warning(f"[VideoMerger] Trim failed (keeping original): {e}")
-        tmp_path.unlink(missing_ok=True)
-
-
 def _concat_mp4_clips(recordings: list[Path], output_path: Path) -> None:
     """Concat multiple .mp4 files into one using ffmpeg concat demuxer (no re-encoding)."""
     concat_list = output_path.parent / "_merge_list.txt"
@@ -346,6 +302,14 @@ def _run_ffmpeg(cmd: list[str], operation: str) -> None:
 
 
 # ─── Metadata ─────────────────────────────────────────────────────────────────
+
+
+def _cleanup_intermediate_clips(video_dir: Path) -> None:
+    """Remove all .mp4/.webm files from the video_clips dir after merge."""
+    for ext in ("*.mp4", "*.webm"):
+        for f in video_dir.glob(ext):
+            f.unlink()
+    logger.info(f"[VideoMerger] Cleaned intermediate clips from {video_dir}")
 
 
 def _save_metadata(

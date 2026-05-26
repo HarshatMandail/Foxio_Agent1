@@ -31,3 +31,6 @@ Thumbs.db
 # Misc
 *.log
 .langgraph_api/
+
+# Secrets / state files with tokens
+**/salesforce_state.json

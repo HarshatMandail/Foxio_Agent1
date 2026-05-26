@@ -212,6 +212,7 @@ class GrokAdapter(VideoGenerationService):
 
         return {
             "model": "grok-imagine-video",
+            "mode": mode,
             "prompt": prompt,
             "duration": duration,
             "aspect_ratio": validated_ar,

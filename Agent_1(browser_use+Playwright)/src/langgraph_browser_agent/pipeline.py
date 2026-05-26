@@ -127,7 +127,9 @@ async def run_full_pipeline(
     user_prompt = (
         f"Professional SaaS tutorial for {agent1_output.platform_name}. "
         f"Smooth realistic cursor, clean 60fps motion, ultra sharp. "
-        f"Task: {user_query}"
+        f"Task: {user_query}\n\n"
+        f"NARRATION SCRIPT (follow this exactly for voice-over and cursor movements):\n"
+        f"{agent1_output.context_for_video}"
     )
 
     try:

@@ -7,12 +7,8 @@ from typing import Optional
 from playwright.async_api import async_playwright, BrowserContext, Page, Playwright
 
 from .config import (
-    BROWSER_DATA_DIR,
     BROWSER_CHANNEL,
-    BROWSER_USER_AGENT,
     HEADLESS,
-    MAX_RETRIES,
-    RETRY_BASE_DELAY,
     SLOW_MO,
     VIDEO_CLIPS_DIR,
 )
@@ -22,32 +18,34 @@ logger = logging.getLogger(__name__)
 
 class BrowserPool:
     """
-    Manages a single persistent browser context with video recording.
-    Recording is always enabled — login portion is filtered out by video merger.
+    Manages browser contexts with video recording.
+    Login happens in a non-recording context. After login, a NEW recording
+    context is created so the video only contains the actual task.
     """
 
     def __init__(self, use_persistent_login: bool = True):
         self._playwright: Optional[Playwright] = None
+        self._browser = None
         self._context: Optional[BrowserContext] = None
         self._lock = asyncio.Lock()
         self._use_persistent_login = use_persistent_login
+        self._is_recording = False
 
     async def acquire(self) -> tuple[BrowserContext, Page]:
-        """Get or create a browser context and page."""
+        """Get or create a browser context and page (always starts without recording)."""
         async with self._lock:
             if self._context is None:
-                await self._launch()
+                await self._launch(recording=False)
 
             try:
                 pages = self._context.pages
                 page = pages[0] if pages else await self._context.new_page()
                 _ = page.url
-                print(f"🔄 [browser_pool] Acquired page | URL: {page.url[:100]}")
                 return self._context, page
             except Exception:
                 logger.warning("Browser context stale, relaunching...")
                 await self._cleanup()
-                await self._launch()
+                await self._launch(recording=False)
                 page = (
                     self._context.pages[0]
                     if self._context.pages
@@ -55,12 +53,41 @@ class BrowserPool:
                 )
                 return self._context, page
 
-    async def _launch(self) -> None:
-        """Launch a browser context with video recording and optional persistent login."""
-        self._playwright = await async_playwright().start()
+    async def restart_with_recording(self) -> tuple[BrowserContext, Page]:
+        """
+        Close the current (non-recording) context and create a new one WITH
+        video recording enabled. Used after login completes so the recording
+        starts clean from the home page.
+        """
+        async with self._lock:
+            if self._is_recording:
+                # Already recording, just return current
+                pages = self._context.pages
+                page = pages[0] if pages else await self._context.new_page()
+                return self._context, page
 
-        video_dir = str(VIDEO_CLIPS_DIR)
-        use_persistent_login = self._use_persistent_login
+            # Save cookies/state from current context before closing
+            storage_state = None
+            if self._context:
+                try:
+                    storage_state = await self._context.storage_state()
+                except Exception:
+                    pass
+                try:
+                    await self._context.close()
+                except Exception:
+                    pass
+                self._context = None
+
+            # Launch new context WITH recording
+            await self._create_context(recording=True, storage_state=storage_state)
+            page = await self._context.new_page()
+            print("🎬 [browser_pool] New recording context started (no login footage)")
+            return self._context, page
+
+    async def _launch(self, recording: bool = False) -> None:
+        """Launch browser and create initial context."""
+        self._playwright = await async_playwright().start()
 
         browser_args = [
             "--disable-blink-features=AutomationControlled",
@@ -83,54 +110,43 @@ class BrowserPool:
         if BROWSER_CHANNEL:
             launch_opts["channel"] = BROWSER_CHANNEL
 
-        browser = await self._playwright.chromium.launch(**launch_opts)
+        self._browser = await self._playwright.chromium.launch(**launch_opts)
 
         state_path = "salesforce_state.json"
+        storage_state = state_path if (self._use_persistent_login and os.path.exists(state_path)) else None
 
-        if use_persistent_login and os.path.exists(state_path):
-            print(f"🔄 [browser_pool] Loading persistent login from {state_path}")
-            context = await browser.new_context(
-                storage_state=state_path,
-                viewport={"width": 1280, "height": 720},
-                record_video_dir=video_dir,
-                record_video_size={"width": 1280, "height": 720},
-                ignore_https_errors=True,
-                extra_http_headers={"Accept-Language": "en-US"},
-            )
+        await self._create_context(recording=recording, storage_state=storage_state)
+
+        logger.info(f"Browser launched | slow_mo={SLOW_MO}ms | headless={HEADLESS} | recording={recording}")
+
+    async def _create_context(self, recording: bool = False, storage_state=None) -> None:
+        """Create a browser context with optional video recording."""
+        context_opts = {
+            "viewport": {"width": 1280, "height": 720},
+            "ignore_https_errors": True,
+            "extra_http_headers": {"Accept-Language": "en-US"},
+        }
+
+        if storage_state:
+            context_opts["storage_state"] = storage_state
+
+        if recording:
+            context_opts["record_video_dir"] = str(VIDEO_CLIPS_DIR)
+            context_opts["record_video_size"] = {"width": 1280, "height": 720}
+            self._is_recording = True
+            print("🎬 [browser_pool] Video recording ENABLED")
         else:
-            print("🔄 [browser_pool] Starting fresh session - will save login after success")
-            context = await browser.new_context(
-                viewport={"width": 1280, "height": 720},
-                record_video_dir=video_dir,
-                record_video_size={"width": 1280, "height": 720},
-                ignore_https_errors=True,
-                extra_http_headers={"Accept-Language": "en-US"},
-            )
+            self._is_recording = False
+            print("🔇 [browser_pool] Video recording DISABLED (login phase)")
 
-        self._context = context
+        self._context = await self._browser.new_context(**context_opts)
 
         await self._context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
         )
 
-        logger.info(f"Browser launched | slow_mo={SLOW_MO}ms | headless={HEADLESS}")
-
-        # === NEW: Save login state ONLY after we are on Seller Home ===
-        if use_persistent_login:
-            await asyncio.sleep(3)  # give page time to settle
-            try:
-                # Check if we are really on the home page
-                if "lightning/page/home" in self._context.pages[0].url or await self._context.pages[0].get_by_text("Seller Home").is_visible(timeout=5000):
-                    await save_login_state(self._context)
-                else:
-                    print("🔄 [browser_pool] Not yet on Seller Home — skipping save for now")
-            except Exception as e:
-                print(f"⚠️ [browser_pool] Could not check home page: {e}")
-
     async def release(self, context=None):
         """Only close context after the full task is done. Do not close early."""
-        print("🔄 [browser_pool] Releasing browser context after task completion...")
-        # Do NOT close the page or context here - let the main graph handle final cleanup
         pass
 
     async def shutdown(self) -> None:
@@ -147,12 +163,21 @@ class BrowserPool:
                 logger.warning(f"Browser close error (non-fatal): {e}")
             self._context = None
 
+        if self._browser:
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+
         if self._playwright:
             try:
                 await self._playwright.stop()
             except Exception:
                 pass
             self._playwright = None
+
+        self._is_recording = False
 
 
 # Module-level singleton
@@ -173,26 +198,6 @@ async def shutdown_browser_pool() -> None:
     if _pool:
         await _pool.shutdown()
         _pool = None
-
-
-# ─── Retry Decorator ──────────────────────────────────────────────────────────
-
-
-async def retry_async(coro_fn, *args, retries: int = MAX_RETRIES, **kwargs):
-    """Execute an async function with exponential backoff retry."""
-    last_error = None
-    for attempt in range(retries):
-        try:
-            return await coro_fn(*args, **kwargs)
-        except Exception as e:
-            last_error = e
-            delay = RETRY_BASE_DELAY * (2 ** attempt)
-            logger.warning(
-                f"Retry {attempt + 1}/{retries} after error: {e} "
-                f"(waiting {delay:.1f}s)"
-            )
-            await asyncio.sleep(delay)
-    raise last_error
 
 
 async def save_login_state(context):
