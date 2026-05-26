@@ -1,6 +1,7 @@
 # browser_pool.py — Browser Pooling with Video Recording
 import asyncio
 import logging
+import os
 from typing import Optional
 
 from playwright.async_api import async_playwright, BrowserContext, Page, Playwright
@@ -52,37 +53,58 @@ class BrowserPool:
                 )
                 return self._context, page
 
-    async def _launch(self) -> None:
-        """Launch a persistent browser context with video recording."""
+    async def _launch(self, use_persistent_login: bool = True) -> None:
+        """Launch a browser context with video recording and optional persistent login."""
         self._playwright = await async_playwright().start()
 
-        launch_kwargs = {
-            "user_data_dir": str(BROWSER_DATA_DIR),
+        video_dir = str(VIDEO_CLIPS_DIR)
+
+        browser_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-extensions",
+            "--disable-infobars",
+            "--disable-popup-blocking",
+            "--hide-scrollbars",
+            "--window-size=1280,720",
+        ]
+
+        launch_opts = {
             "headless": HEADLESS,
-            "viewport": {"width": 1280, "height": 720},
-            "user_agent": BROWSER_USER_AGENT,
-            "record_video_dir": str(VIDEO_CLIPS_DIR),
-            "record_video_size": {"width": 1280, "height": 720},
             "slow_mo": SLOW_MO,
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-extensions",
-                "--disable-infobars",
-                "--disable-popup-blocking",
-                "--hide-scrollbars",
-                "--window-size=1280,720",
-            ],
+            "args": browser_args,
             "ignore_default_args": ["--enable-automation"],
         }
 
         if BROWSER_CHANNEL:
-            launch_kwargs["channel"] = BROWSER_CHANNEL
+            launch_opts["channel"] = BROWSER_CHANNEL
 
-        self._context = await self._playwright.chromium.launch_persistent_context(
-            **launch_kwargs
-        )
+        browser = await self._playwright.chromium.launch(**launch_opts)
+
+        state_path = "salesforce_state.json"
+
+        if use_persistent_login and os.path.exists(state_path):
+            print(f"🔄 [browser_pool] Loading persistent login from {state_path}")
+            context = await browser.new_context(
+                storage_state=state_path,
+                viewport={"width": 1280, "height": 720},
+                record_video_dir=video_dir,
+                record_video_size={"width": 1280, "height": 720},
+                ignore_https_errors=True,
+                extra_http_headers={"Accept-Language": "en-US"},
+            )
+        else:
+            print("🔄 [browser_pool] Starting fresh browser session (no saved login)")
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 720},
+                record_video_dir=video_dir,
+                record_video_size={"width": 1280, "height": 720},
+                ignore_https_errors=True,
+                extra_http_headers={"Accept-Language": "en-US"},
+            )
+
+        self._context = context
 
         await self._context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
@@ -150,3 +172,13 @@ async def retry_async(coro_fn, *args, retries: int = MAX_RETRIES, **kwargs):
             )
             await asyncio.sleep(delay)
     raise last_error
+
+
+async def save_login_state(context):
+    """Save login state after successful login so future runs start already logged in."""
+    state_path = "salesforce_state.json"
+    try:
+        await context.storage_state(path=state_path)
+        print(f"✅ [browser_pool] Saved persistent login state to {state_path}")
+    except Exception as e:
+        print(f"⚠️ [browser_pool] Could not save login state: {e}")

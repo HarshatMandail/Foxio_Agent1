@@ -261,7 +261,7 @@ async def navigate_and_crawl(state: AgentState) -> dict:
         # Step 2: LLM-driven workflow navigation on the SAME page
         if primary_capture:
             workflow_captures = await _execute_workflow_navigation(
-                page, primary_capture, state["user_query"], audit,
+                page, primary_capture, state["user_query"], audit, state,
             )
             captures.extend(workflow_captures)
 
@@ -269,6 +269,8 @@ async def navigate_and_crawl(state: AgentState) -> dict:
         logger.error(f"Browser operation failed: {e}")
         audit.log("browser_error", {"error": str(e)})
         captures = []
+
+    await capture_page(page, state)  # final capture
 
     audit.log("capture_complete", {"pages_captured": len(captures)})
     audit.save()
@@ -284,6 +286,7 @@ async def _execute_workflow_navigation(
     primary: PageCapture,
     user_query: str,
     audit: AuditLogger,
+    state=None,
 ) -> list[PageCapture]:
     """
     Navigate through workflow steps on the SAME page.
@@ -319,7 +322,7 @@ async def _execute_workflow_navigation(
         audit.log("workflow_step", {"step": i+1, "action": action, "target": target[:80]})
 
         try:
-            navigated = await _execute_single_step(page, action, target)
+            navigated = await _execute_single_step(page, action, target, state)
             if not navigated:
                 logger.warning(f"  Step {i+1}: Could not execute, skipping.")
                 audit.log("workflow_step_skipped", {"step": i+1, "reason": "element_not_found"})
@@ -352,17 +355,22 @@ async def _execute_workflow_navigation(
     return extra_captures
 
 
-async def _execute_single_step(page: Page, action: str, target: str) -> bool:
+async def _execute_single_step(page: Page, action: str, target: str, state=None) -> bool:
     """Execute a single navigation step on the current page."""
     if action == "goto_url":
         await page.goto(target, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT_MS)
+        await capture_page(page, state)
         return True
 
     if action == "click_nav":
-        return await _click_element(page, target, element_type="link")
+        result = await _click_element(page, target, element_type="link")
+        await capture_page(page, state)
+        return result
 
     if action == "click_button":
-        return await _click_element(page, target, element_type="button")
+        result = await _click_element(page, target, element_type="button")
+        await capture_page(page, state)
+        return result
 
     logger.warning(f"Unknown action type: {action}")
     return False
